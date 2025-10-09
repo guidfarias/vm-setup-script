@@ -88,7 +88,7 @@ log_info "Configurando Neovim como editor padrão..."
 # Criar diretório de configuração do Neovim
 mkdir -p /root/.config/nvim
 
-# Configuração básica do Neovim com tema e melhorias visuais
+# Configuração do Neovim com tema escuro minimalista (inspirado em oxocarbon)
 cat > /root/.config/nvim/init.vim << 'EOF'
 " Configuração básica do Neovim
 set number              " Mostrar números das linhas
@@ -110,8 +110,29 @@ set signcolumn=yes      " Coluna de sinais sempre visível
 set updatetime=300      " Tempo de atualização mais rápido
 set timeoutlen=500      " Timeout para mapeamentos
 
-" Tema de cores
-colorscheme desert      " Tema padrão mais bonito
+" Tema minimalista escuro personalizado (inspirado em oxocarbon)
+colorscheme habamax     " Base moderna e limpa
+hi Normal guibg=#161616 guifg=#f2f4f8
+hi CursorLine guibg=#262626
+hi LineNr guifg=#525252 guibg=#161616
+hi CursorLineNr guifg=#78a9ff guibg=#262626 gui=bold
+hi Comment guifg=#6f6f6f gui=italic
+hi Statement guifg=#ee5396 gui=bold
+hi Type guifg=#3ddbd9
+hi String guifg=#33b1ff
+hi Function guifg=#be95ff
+hi Constant guifg=#ff7eb6
+hi PreProc guifg=#42be65
+hi Special guifg=#ff6f00
+hi Identifier guifg=#82cfff
+hi Visual guibg=#393939
+hi Search guibg=#42be65 guifg=#161616
+hi IncSearch guibg=#ee5396 guifg=#161616
+hi StatusLine guibg=#262626 guifg=#f2f4f8
+hi StatusLineNC guibg=#1c1c1c guifg=#6f6f6f
+hi VertSplit guibg=#161616 guifg=#393939
+hi Pmenu guibg=#262626 guifg=#f2f4f8
+hi PmenuSel guibg=#393939 guifg=#78a9ff
 
 " Melhorar visualização
 set list                " Mostrar caracteres invisíveis
@@ -145,7 +166,7 @@ if ! grep -q "alias vim='nvim'" /root/.bashrc; then
     echo "export VISUAL='nvim'" >> /root/.bashrc
 fi
 
-log_info "Neovim configurado com tema e melhorias visuais"
+log_info "Neovim configurado com tema escuro minimalista"
 
 ###Melhorias no bash###
 log_info "Aplicando melhorias no bash prompt..."
@@ -221,12 +242,26 @@ log_info "Zabbix Agent configurado e iniciado"
 ###Configuração de Autenticação SSH###
 log_info "=== Configurando autenticação SSH com chaves ==="
 
+###Backup da configuração SSH atual###
+log_info "Fazendo backup da configuração SSH..."
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
+
+###PASSO 1: Garantir que root está habilitado temporariamente###
+log_info "Habilitando acesso root temporariamente para download da chave..."
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# Reiniciar SSH para aplicar
+systemctl restart sshd
+log_info "SSH configurado para permitir acesso root temporariamente"
+
 ###Criação das Chaves SSH###
 log_info "Gerando par de chaves SSH ED25519 (mais seguro e rápido)..."
 SSH_KEY_NAME="$(hostname)"
 SSH_KEY_PATH="/root/.ssh/${SSH_KEY_NAME}"
 
 if [ ! -f "${SSH_KEY_PATH}" ]; then
+    mkdir -p /root/.ssh
     ssh-keygen -t ed25519 -a 100 -f "${SSH_KEY_PATH}" -C "SSH Key - $(hostname) - $(date +%Y-%m-%d)" -N ""
     log_info "Chaves SSH criadas: ${SSH_KEY_PATH}"
 else
@@ -267,12 +302,61 @@ cp -r /root/.config/nvim /home/supcip/.config/
 chown -R supcip:supcip /home/supcip/.bashrc /home/supcip/.config
 log_info "Configurações do bash e nvim copiadas para supcip"
 
-###Backup da configuração SSH atual###
-log_info "Fazendo backup da configuração SSH..."
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
+###PASSO 2: Instruções para download da chave privada###
+echo
+echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}DOWNLOAD DA CHAVE SSH${NC}"
+echo -e "${CYAN}========================================${NC}"
+log_warning "IMPORTANTE: Você DEVE baixar a chave privada AGORA!"
+echo
+echo -e "${YELLOW}Localização da chave:${NC} ${SSH_KEY_PATH}"
+echo
+echo -e "${GREEN}Método - SCP:${NC}"
+echo -e "No seu computador, execute:"
+echo -e "${CYAN}scp root@$(hostname -I | awk '{print $1}'):${SSH_KEY_PATH} ~/Downloads/${SSH_KEY_NAME}.key${NC}"
+echo -e "${RED}ATENÇÃO: Após baixar, ajuste as permissões:${NC}"
+echo -e "${CYAN}chmod 600 ~/Downloads/${SSH_KEY_NAME}.key${NC}"
+echo -e "${CYAN}========================================${NC}"
+echo
 
-###Configuração do servidor SSH###
-log_info "Configurando servidor SSH para aceitar apenas autenticação por chave..."
+read -p "Pressione ENTER após baixar a chave privada para continuar..."
+log_info "Continuando configuração..."
+
+###PASSO 3: TESTE OBRIGATÓRIO DE CONEXÃO###
+echo
+echo -e "${RED}========================================${NC}"
+echo -e "${RED}TESTE DE CONEXÃO OBRIGATÓRIO${NC}"
+echo -e "${RED}========================================${NC}"
+log_warning "Antes de bloquear o root, você DEVE testar a conexão SSH!"
+echo
+echo -e "${YELLOW}Em OUTRO TERMINAL, execute:${NC}"
+echo -e "${CYAN}ssh -i ~/Downloads/${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
+echo
+echo -e "${YELLOW}Após conectar com sucesso:${NC}"
+echo -e "1. Teste o comando: ${CYAN}sudo -l${NC}"
+echo -e "2. Verifique se consegue executar comandos com sudo"
+echo -e "3. ${RED}NÃO FECHE ESTA SESSÃO até confirmar que tudo funciona!${NC}"
+echo
+echo -e "${RED}========================================${NC}"
+echo
+
+# Loop de confirmação obrigatório
+CONEXAO_OK="false"
+while [ "$CONEXAO_OK" != "Sim" ]; do
+    echo -n "Você testou e confirmou que consegue conectar via SSH com o usuário supcip? [Sim/Nao]: "
+    read CONEXAO_OK
+    
+    if [ "$CONEXAO_OK" != "Sim" ]; then
+        log_error "Você PRECISA testar a conexão antes de continuar!"
+        log_warning "Execute em outro terminal: ssh -i ~/Downloads/${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')"
+        echo
+    fi
+done
+
+log_info "Teste de conexão confirmado! Prosseguindo com hardening..."
+
+###PASSO 4: Aplicar hardening SSH (desabilitar root)###
+log_info "Aplicando configurações de segurança SSH..."
 
 cat > /etc/ssh/sshd_config.d/99-hardening.conf << 'EOF'
 # Configurações de segurança SSH
@@ -305,34 +389,16 @@ else
     exit 1
 fi
 
-###Instruções para download da chave privada###
-echo
-echo -e "${CYAN}========================================${NC}"
-echo -e "${CYAN}DOWNLOAD DA CHAVE SSH${NC}"
-echo -e "${CYAN}========================================${NC}"
-log_warning "IMPORTANTE: Você DEVE baixar a chave privada AGORA!"
-echo
-echo -e "${YELLOW}Localização da chave:${NC} ${SSH_KEY_PATH}"
-echo
-echo -e "${GREEN}Método - SCP:${NC}"
-echo -e "No seu computador, execute:"
-echo -e "${CYAN}scp root@$(hostname -I | awk '{print $1}'):${SSH_KEY_PATH} ~/Downloads/${SSH_KEY_NAME}.key${NC}"
-echo -e "${RED}ATENÇÃO: Após baixar, ajuste as permissões:${NC}"
-echo -e "${CYAN}chmod 600 ${SSH_KEY_NAME}.key${NC}"
-echo
-echo -e "${YELLOW}Para conectar após a configuração:${NC}"
-echo -e "${CYAN}ssh -i ${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
-echo -e "${CYAN}========================================${NC}"
-echo
-
-read -p "Pressione ENTER após baixar a chave privada para continuar..."
-log_info "Continuando configuração..."
-
 ###Configurações finais de segurança###
 log_info "Aplicando configurações finais de segurança..."
 
 # Desabilitar login com senha vazia
 sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+
+# Reiniciar SSH para aplicar hardening
+log_warning "Reiniciando SSH com configurações de segurança..."
+systemctl restart sshd
+log_info "SSH configurado com hardening completo"
 
 ###Fim da configuração###
 echo
@@ -343,15 +409,15 @@ echo -e "Hostname: ${CYAN}$(hostname)${NC}"
 echo -e "IP: ${CYAN}$(hostname -I | awk '{print $1}')${NC}"
 echo -e "Timezone: ${CYAN}$timezone${NC}"
 echo -e "Usuário SSH: ${CYAN}supcip${NC}"
-echo -e "Editor: ${CYAN}Neovim (nvim)${NC}"
+echo -e "Editor: ${CYAN}Neovim (nvim) - Tema escuro minimalista${NC}"
 echo -e "Zabbix Server: ${CYAN}200.187.67.220${NC}"
 echo -e "Chave SSH: ${CYAN}${SSH_KEY_PATH}${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo
 echo -e "${YELLOW}Próximos passos:${NC}"
-echo -e "1. ${CYAN}Teste a conexão SSH em outro terminal ANTES de reiniciar${NC}"
-echo -e "2. ${CYAN}Mantenha esta sessão aberta até confirmar o acesso${NC}"
-echo -e "3. ${CYAN}Reinicie o servidor para aplicar todas as configurações${NC}"
+echo -e "1. ${RED}MANTENHA a conexão de teste aberta!${NC}"
+echo -e "2. ${CYAN}Reinicie o servidor para aplicar todas as configurações${NC}"
+echo -e "3. ${CYAN}Após reboot, conecte usando: ssh -i ${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
 echo
 
 ###Reiniciar o servidor###
@@ -361,13 +427,13 @@ read REBOOT_CONFIRM
 
 if [ "$REBOOT_CONFIRM" = "Sim" ]; then
     log_info "Reiniciando servidor em 10 segundos..."
-    log_warning "CERTIFIQUE-SE DE TER BAIXADO A CHAVE SSH!"
+    log_warning "MANTENHA sua conexão de teste aberta!"
     sleep 10
     reboot
 else
     log_warning "Lembre-se de reiniciar o servidor manualmente!"
     log_info "Para reiniciar: sudo reboot"
     echo
-    log_info "Para testar SSH antes de reiniciar:"
-    echo -e "${CYAN}ssh -i ${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
+    log_info "Comando para conectar após reboot:"
+    echo -e "${CYAN}ssh -i ~/Downloads/${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
 fi
