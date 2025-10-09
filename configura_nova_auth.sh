@@ -1,268 +1,373 @@
 #!/bin/bash
 #################################################################
-# Script desenvolvido por Guilherme Farias e Matheus Bevilaqua.	#
-# Data de criação: 05/12/2023.					#
-# Data da última atualização: 06/12/2023.			#
+# Script de configuração de VM - Versão Atualizada             #
+# Desenvolvido por: Guilherme Farias      #
+# Atualizado em: Outubro de 2025                               #
 #################################################################
 
+set -euo pipefail  # Parar em erros, variáveis não definidas e erros em pipes
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Funções auxiliares
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+    sleep 1
+}
+
+log_warning() {
+    echo -e "${YELLOW}[AVISO]${NC} $1"
+    sleep 1
+}
+
+log_error() {
+    echo -e "${RED}[ERRO]${NC} $1"
+    sleep 1
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Este script precisa ser executado como root!"
+        exit 1
+    fi
+}
+
+# Verificar se é root
+check_root
+
 ###Início da configuração###
-sleep	1
-	echo "Iniciando configuração da nova máquina virtual..."
-sleep	3
+log_info "=== Iniciando configuração da nova máquina virtual ==="
+sleep 2
+
+###Atualização inicial do sistema###
+log_info "Atualizando lista de pacotes..."
+apt update -y || { log_error "Falha ao atualizar pacotes"; exit 1; }
+
+log_info "Atualizando pacotes instalados (isso pode demorar)..."
+DEBIAN_FRONTEND=noninteractive apt upgrade -y || { log_error "Falha ao fazer upgrade"; exit 1; }
 
 ###Configurações de data e hora###
-	echo "Alterando o timezone do servidor..."
-sleep	2
-		timedatectl set-timezone America/Sao_Paulo
-		timezone=$(timedatectl status | grep zone | awk {'print $3'})
-	echo "O timezone do servidor foi alterado para: $timezone."
-sleep   2
-	echo "Alterando o tipo de hora do servidor de 12 para 24 horas..."
-		localectl set-locale LC_TIME=en_GB.UTF-8
-sleep   2
-	echo "O tipo de hora do servidor foi alterado de 12 para 24 horas."
-sleep   2
+log_info "Configurando timezone para America/Sao_Paulo..."
+timedatectl set-timezone America/Sao_Paulo
+timezone=$(timedatectl status | grep "Time zone" | awk '{print $3}')
+log_info "Timezone configurado: $timezone"
 
-###Configurações do editor de texto###
-	echo "Alterando o editor de textos para podermos enxergar..."
-sleep   2
-	echo "set bg=dark" >> /etc/vim/vimrc
-sleep   2
-	echo "Agora podemos enxergar com o editor de texto."
+log_info "Configurando formato de hora 24h..."
+localectl set-locale LC_TIME=en_GB.UTF-8
+log_info "Formato de hora configurado com sucesso"
 
-###Configurações do usuário DropMySite ###
-sleep   2
-	echo "Criando o usuário 'dropmysite' com a senha padrão..."
-sleep   2
-		useradd -m dropmysite
-		echo "dropmysite:DprmS85#7@a68hK9s" | chpasswd
-sleep	2
-	echo "O usuário dropmysite foi criado com a senha padrão."
-sleep	2
+###Instalação de pacotes essenciais###
+log_info "Instalando pacotes essenciais..."
+apt-get install -y \
+    traceroute \
+    mlocate \
+    wget \
+    curl \
+    neovim \
+    net-tools \
+    htop \
+    tmux \
+    git \
+    unzip \
+    gnupg \
+    ca-certificates \
+    software-properties-common || {
+    log_error "Falha na instalação de pacotes essenciais"
+    exit 1
+}
+log_info "Pacotes essenciais instalados com sucesso"
 
-###Configurações de permissão do usuário DropMySite###
-	echo "Aplicando a permissão de Mestre dos Magos para o usuário dropmysite.."
-sleep   2
-		usermod -aG sudo dropmysite
-	echo "O usuário dropmysite é um dos Mestres dos Magos deste servidor."
-sleep   2
+###Configurações do Neovim###
+log_info "Configurando Neovim como editor padrão..."
 
-###Configuração da pasta de Backups dos Bancos de Dados###
-	echo "Criando a pasta para os backups dos Bancos de Dados..."
-sleep   2
-		mkdir /home/dropmysite/dbsbackups
-	
-	echo "A pasta para os backups dos Bancos de Dados foi criada."
-sleep   2
+# Criar diretório de configuração do Neovim
+mkdir -p /root/.config/nvim
 
-###Configuração da pasta de Chaves SSH###
-	echo "Criando a pasta para as chaves SSH do usuário 'dropmysite'..."
-sleep   2
-		mkdir /home/dropmysite/.ssh
-	echo "A pasta para as chaves SSH do usuário 'dropmysite' foi criada."
-sleep	2
+# Configuração básica do Neovim com tema e melhorias visuais
+cat > /root/.config/nvim/init.vim << 'EOF'
+" Configuração básica do Neovim
+set number              " Mostrar números das linhas
+set relativenumber      " Números relativos
+set mouse=a             " Habilitar mouse
+set clipboard=unnamedplus " Clipboard do sistema
+set expandtab           " Usar espaços ao invés de tabs
+set tabstop=4           " Tamanho do tab
+set shiftwidth=4        " Tamanho da indentação
+set autoindent          " Auto-indentação
+set smartindent         " Indentação inteligente
+set cursorline          " Destacar linha atual
+set termguicolors       " Cores true color
+set background=dark     " Fundo escuro
+syntax enable           " Syntax highlighting
+set encoding=utf-8      " Encoding UTF-8
+set scrolloff=8         " Manter linhas visíveis ao rolar
+set signcolumn=yes      " Coluna de sinais sempre visível
+set updatetime=300      " Tempo de atualização mais rápido
+set timeoutlen=500      " Timeout para mapeamentos
 
-###Criação do Script para Backups dos Bancos de Dados###
-	echo "Criando o script para os Backups dos Bancos de Dados..."
-sleep   2
-	cat <<EOL > /home/dropmysite/dbsbackups/dbsbackup.sh
-cd /home/dropmysite/dbsbackups/
-find *.sql.gz -mtime 3 -delete
-for DB in \$(mysql -e 'show databases' -s --skip-column-names) ; do mysqldump \$DB | gzip > "\$DB-\$(date +%Y%m%d).sql.gz" ; done
-chown dropmysite:dropmysite *.sql.gz
-EOL
-	chmod 777 /home/dropmysite/dbsbackups/dbsbackup.sh
-sleep   2
-	echo "O script para os backups dos bancos de dados foi criado com sucesso!"
-sleep   2
+" Tema de cores
+colorscheme desert      " Tema padrão mais bonito
 
+" Melhorar visualização
+set list                " Mostrar caracteres invisíveis
+set listchars=tab:→\ ,trail:·,nbsp:␣
+
+" Pesquisa
+set ignorecase          " Ignorar case na busca
+set smartcase           " Case sensitive se usar maiúsculas
+set incsearch           " Busca incremental
+set hlsearch            " Highlight de busca
+
+" Backup e swap
+set nobackup
+set nowritebackup
+set noswapfile
+
+" Atalhos úteis
+nnoremap <C-s> :w<CR>   " Ctrl+S para salvar
+inoremap <C-s> <Esc>:w<CR>a
+EOF
+
+# Definir Neovim como editor padrão
+update-alternatives --set editor /usr/bin/nvim 2>/dev/null || \
+update-alternatives --install /usr/bin/editor editor /usr/bin/nvim 100
+
+# Criar alias para facilitar
+if ! grep -q "alias vim='nvim'" /root/.bashrc; then
+    echo "alias vim='nvim'" >> /root/.bashrc
+    echo "alias vi='nvim'" >> /root/.bashrc
+    echo "export EDITOR='nvim'" >> /root/.bashrc
+    echo "export VISUAL='nvim'" >> /root/.bashrc
+fi
+
+log_info "Neovim configurado com tema e melhorias visuais"
+
+###Melhorias no bash###
+log_info "Aplicando melhorias no bash prompt..."
+if ! grep -q "PS1 customizado" /root/.bashrc; then
+    cat >> /root/.bashrc << 'EOF'
+
+# PS1 customizado
+export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+
+# Aliases úteis
+alias ll='ls -lah --color=auto'
+alias la='ls -A'
+alias l='ls -CF'
+alias grep='grep --color=auto'
+alias df='df -h'
+alias free='free -h'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# History melhorado
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+export HISTTIMEFORMAT="%Y-%m-%d %H:%M:%S "
+export HISTCONTROL=ignoredups:erasedups
+EOF
+    log_info "Melhorias no bash aplicadas"
+fi
 
 ###Instalação do Zabbix###
-	echo "Instalando o agente do Zabbix para o monitoramento do servidor..."
-sleep	2
-	apt-get install zabbix-agent -y
-sleep	1
-	echo "O agente do Zabbix foi instalado com sucesso!"
-sleep   1
-	echo "Agora vamos configurar o agente de monitoramento..."
-sleep	1
-	echo "Configurando o apontamento para o IP do Zabbix Server..."
-		sed -i 's/Server=127.0.0.1/Server=13.90.72.25/g' /etc/zabbix/zabbix_agentd.conf
-sleep	1
-	echo "Configurando o apontamento para o FQDN do Zabbix Server..."
-		sed -i 's/ServerActive=127.0.0.1/ServerActive=zbx-server.nubiway.com.br/g' /etc/zabbix/zabbix_agentd.conf
-sleep	1
-	echo "Configurando o hostname para a comunicação do Zabbix Server..."
-		for h in $(hostname) ; do sed -i "s/Hostname=Zabbix server/Hostname=$h/g" /etc/zabbix/zabbix_agentd.conf ; done
-sleep	1
-	echo "Criando a regra de Firewall para a comunicação com o Zabbix Server..."
-		firewall-cmd --add-port=10050/tcp --permanent
-sleep	1
-	echo "Recompilando o Firewall..."
-		firewall-cmd --reload
-sleep   1
-	echo "Checando se a regra foi criada corretamente..."
-	regrafw=$(firewall-cmd --list-all | grep -o 10050)
-sleep	2
-if [ $regrafw = 10050 ]
-        then
-                echo "A regra foi criada corretamente!"
-        else
-                echo "A regra não foi criada corretamente. Cheque isso depois!"
+log_info "Instalando e configurando Zabbix Agent..."
+
+# Instalar Zabbix Agent 2 (versão mais recente)
+apt-get install -y zabbix-agent2 || {
+    log_warning "Falha ao instalar zabbix-agent2, tentando zabbix-agent..."
+    apt-get install -y zabbix-agent
+}
+
+# Configurar Zabbix
+ZABBIX_CONF="/etc/zabbix/zabbix_agent2.conf"
+if [ ! -f "$ZABBIX_CONF" ]; then
+    ZABBIX_CONF="/etc/zabbix/zabbix_agentd.conf"
 fi
-sleep	1
-	echo "O agente do Zabbix foi configurado com sucesso!"
-sleep	2
 
-###Instalação de comandos do dia-a-dia###
-	echo "Instalando alguns comandos para faciltar a utilização da galera..."
-sleep   2
-		apt-get install traceroute mlocate wget -y
-sleep	2
-	echo "Os comandos para faciltar a utilização da galera foram instalados com sucesso!"
-sleep   2
+log_info "Configurando Zabbix Agent..."
+sed -i 's/^Server=.*/Server=200.187.67.220/' "$ZABBIX_CONF"
+sed -i 's/^ServerActive=.*/ServerActive=200.187.67.220/' "$ZABBIX_CONF"
+sed -i "s/^Hostname=.*/Hostname=$(hostname)/" "$ZABBIX_CONF"
 
-###Atualização dos pacotes do Sistema Operacional###
-        echo "Atualizando os pacotes atualizáveis do servidor..."
-sleep   2
-                apt upgrade -y
-sleep   2
-        echo "Os pacotes foram atualizados com sucesso."
-sleep   3
+# Configurar firewall se existir
+if command -v firewall-cmd &> /dev/null; then
+    log_info "Configurando firewall para Zabbix..."
+    firewall-cmd --add-port=10050/tcp --permanent
+    firewall-cmd --reload
+    
+    if firewall-cmd --list-all | grep -q 10050; then
+        log_info "Regra de firewall criada com sucesso"
+    else
+        log_warning "Regra de firewall pode não ter sido criada corretamente"
+    fi
+elif command -v ufw &> /dev/null; then
+    log_info "Configurando UFW para Zabbix..."
+    ufw allow 10050/tcp
+    log_info "Regra UFW criada"
+else
+    log_warning "Nenhum firewall detectado (firewalld/ufw)"
+fi
 
-###Atualização do Sistema Operacional###
-	echo "Atualizando o servidor para finalizar a configuração..."
-sleep   2
-		apt update -y
-sleep	2
-	echo "O servidor foi atualizado com sucesso."
-sleep   3
+# Reiniciar serviço Zabbix
+systemctl restart zabbix-agent2 2>/dev/null || systemctl restart zabbix-agent
+systemctl enable zabbix-agent2 2>/dev/null || systemctl enable zabbix-agent
+log_info "Zabbix Agent configurado e iniciado"
 
-###Alteração da Senha do Root###
-	echo "Alterando a senha do root do servidor..."
-	echo -n "Insira a nova senha do root:"
-                read novasenha
-        echo "A nova senha é: $novasenha"
-sleep   1
-		echo "root:$novasenha" | chpasswd
-	echo "A senha do root foi alterada com sucesso!"
-sleep	3
-
-###Configuração da Autenticação por chaves SSH###
-sleep   1
-        echo "Iniciando a configuração da autenticação via chaves SSH para este servidor..."
-sleep   3
+###Configuração de Autenticação SSH###
+log_info "=== Configurando autenticação SSH com chaves ==="
 
 ###Criação das Chaves SSH###
-        echo "Criando o par de chaves SSH (Chave Pública e Chave Privada)..."
-sleep   2
-                ssh-keygen -t rsa -b 4096 -P '' -f /root/.ssh/server.key -C "Chave SSH do Servidor"
-sleep   2
-        echo "As chaves foram criadas! Agora estamos deixando elas legíveis..."
-sleep   2
-		for keyname in $(hostname) ; do mv /root/.ssh/server.key /root/.ssh/$keyname.key ; done
-		for keyname in $(hostname) ; do mv /root/.ssh/server.key.pub /root/.ssh/$keyname.key.pub ; done
-sleep   2
+log_info "Gerando par de chaves SSH ED25519 (mais seguro e rápido)..."
+SSH_KEY_NAME="$(hostname)"
+SSH_KEY_PATH="/root/.ssh/${SSH_KEY_NAME}"
 
-###Criação do usuário de autenticação para as Chaves SSH###
-        echo "Criando o usuário 'supcip' para logar apenas com chave SSH..."
-sleep   3
-                useradd -m supcip
-sleep   3
-        echo "O usuário 'supcip' foi criado sem senha, só funcionará com chave SSH."
-sleep   3
-	echo "Criando a pasta para as chaves SSH do usuário 'supcip'..."
-sleep   3
-                mkdir /home/supcip/.ssh
-                touch /home/supcip/.ssh/authorized_keys
-                chown supcip:supcip /home/supcip/.ssh -R
+if [ ! -f "${SSH_KEY_PATH}" ]; then
+    ssh-keygen -t ed25519 -a 100 -f "${SSH_KEY_PATH}" -C "SSH Key - $(hostname) - $(date +%Y-%m-%d)" -N ""
+    log_info "Chaves SSH criadas: ${SSH_KEY_PATH}"
+else
+    log_warning "Chave SSH já existe em ${SSH_KEY_PATH}"
+fi
 
-                validapermissao=$(ls -la /home/supcip/.ssh | grep auth | awk {'print $3'})
-                        if [ $validapermissao = supcip ]
-                                then
-                                echo "A pasta para as chaves SSH do usuário 'supcip' foi criada, com as permissões corretas."
-                        else
-                                echo -n "A permissão da pasta está errada. Você quer parar o script para ver isso agora? [Digite Sim ou Não]"
-                        read checapermissao
-                                echo "Você escolheu: $checapermissao"
-sleep   3
-                        if [ $checapermissao = Sim ]
-                                then
-                                echo "Bye Bye!"
-                                exit
-                        else
-                                echo "Cuidado para não perder o acesso ao servidor."
-                        fi
-                        fi
-###Configuração do acesso pela chave pública###
-        echo "Habilitando a chave pública para o acesso SSH ao servidor..."
-sleep   2
-		cat /root/.ssh/*.pub | tr -d '\n' >> /home/supcip/.ssh/authorized_keys
-sleep   2
-        echo "A chave pública foi habilitada para acesso SSH com sucesso!"
+###Criação do usuário de autenticação SSH###
+log_info "Configurando usuário 'supcip' para acesso via SSH..."
+if ! id "supcip" &>/dev/null; then
+    useradd -m -s /bin/bash supcip
+    log_info "Usuário 'supcip' criado"
+else
+    log_warning "Usuário 'supcip' já existe"
+fi
 
-###Configurações de permissão do usuário SupCip###
-        echo "Aplicando a permissão para o usuário 'supcip' poder virar 'root' no servidor..."
-sleep   2
-                sed -i '29i supcip ALL=(ALL) NOPASSWD:ALL' /etc/sudoers
-sleep   2
-        echo "Pronto! Agora o usuário 'supcip' pode logar como 'root' no servidor."
-sleep   2
+# Configurar diretório SSH
+mkdir -p /home/supcip/.ssh
+touch /home/supcip/.ssh/authorized_keys
+chmod 700 /home/supcip/.ssh
+chmod 600 /home/supcip/.ssh/authorized_keys
 
-###Download da chave privada para os usuários da Cipnet###
-        echo "Agora é hora de baixar a chave prívada no seu computador para poder logar via SSH."
-sleep   3
-        echo -n "Você baixou a chave privada? [Digite Sim ou Não]"
-                while true;
-                do
-                        read download
-                                echo "Você escolheu: $download"
-sleep   3
-                                if [ $download = Sim ]
-                                        then
-                                        echo "Show de bola! Continuando a configuração..."
-                                        break
-                                fi
-                done
-sleep   3
+# Adicionar chave pública
+cat "${SSH_KEY_PATH}.pub" >> /home/supcip/.ssh/authorized_keys
+chown -R supcip:supcip /home/supcip/.ssh
+log_info "Chave pública adicionada ao authorized_keys"
 
-###Alterando a configuração do servidor SSH###
-        echo "Alterando a configuração do servidor SSH para aceitar apenas autenticação com chave..."
-sleep   3
-                sed -i 's/PermitRootLogin yes/PermitRootLogin no/g' /etc/ssh/sshd_config
-                sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/g' /etc/ssh/sshd_config
-                sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
-		sed -i '42i AuthorizedKeysFile     .ssh/authorized_keys' /etc/ssh/sshd_config
-                sed -i '20i HostKey /etc/ssh/ssh_host_rsa_key' /etc/ssh/sshd_config
-sleep   3
-        echo "Aplicando as configurações do SSH, nos demais arquivos necessários..."
-                validaconf=$(ls -la /etc/ssh/sshd_config.d/ | awk {'print $9'} | grep .conf)
-                        sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config.d/$validaconf
-sleep   3
-        echo "A configuração foi aplicada nos demais arquivos com sucesso!"
-sleep   3
+# Configurar sudo sem senha para supcip
+if [ ! -f /etc/sudoers.d/supcip ]; then
+    echo "supcip ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/supcip
+    chmod 440 /etc/sudoers.d/supcip
+    log_info "Permissões sudo configuradas para 'supcip'"
+fi
+
+# Aplicar alias e configurações do bash para supcip
+cp /root/.bashrc /home/supcip/.bashrc
+mkdir -p /home/supcip/.config
+cp -r /root/.config/nvim /home/supcip/.config/
+chown -R supcip:supcip /home/supcip/.bashrc /home/supcip/.config
+log_info "Configurações do bash e nvim copiadas para supcip"
+
+###Backup da configuração SSH atual###
+log_info "Fazendo backup da configuração SSH..."
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
+
+###Configuração do servidor SSH###
+log_info "Configurando servidor SSH para aceitar apenas autenticação por chave..."
+
+cat > /etc/ssh/sshd_config.d/99-hardening.conf << 'EOF'
+# Configurações de segurança SSH
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxAuthTries 3
+MaxSessions 10
+Protocol 2
+EOF
+
+log_info "Arquivo de configuração SSH criado"
+
+###Validação da configuração SSH###
+log_info "Validando configuração SSH..."
+if sshd -t 2>/dev/null; then
+    log_info "Configuração SSH válida"
+else
+    log_error "Configuração SSH inválida! Revertendo backup..."
+    rm /etc/ssh/sshd_config.d/99-hardening.conf
+    exit 1
+fi
+
+###Instruções para download da chave privada###
+echo
+echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}DOWNLOAD DA CHAVE SSH${NC}"
+echo -e "${CYAN}========================================${NC}"
+log_warning "IMPORTANTE: Você DEVE baixar a chave privada AGORA!"
+echo
+echo -e "${YELLOW}Localização da chave:${NC} ${SSH_KEY_PATH}"
+echo
+echo -e "${GREEN}Método - SCP:${NC}"
+echo -e "No seu computador, execute:"
+echo -e "${CYAN}scp root@$(hostname -I | awk '{print $1}'):${SSH_KEY_PATH} ~/Downloads/${SSH_KEY_NAME}.key${NC}"
+echo -e "${RED}ATENÇÃO: Após baixar, ajuste as permissões:${NC}"
+echo -e "${CYAN}chmod 600 ${SSH_KEY_NAME}.key${NC}"
+echo
+echo -e "${YELLOW}Para conectar após a configuração:${NC}"
+echo -e "${CYAN}ssh -i ${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
+echo -e "${CYAN}========================================${NC}"
+echo
+
+read -p "Pressione ENTER após baixar a chave privada para continuar..."
+log_info "Continuando configuração..."
+
+###Configurações finais de segurança###
+log_info "Aplicando configurações finais de segurança..."
+
+# Desabilitar login com senha vazia
+sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
 
 ###Fim da configuração###
-	echo "A configuração do servidor novo foi finalizada com sucesso!"
-sleep	2
-
-        echo
-        echo "Último"
-        echo "Passo"
-        echo
-
-sleep   3
+echo
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}CONFIGURAÇÃO CONCLUÍDA!${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo -e "Hostname: ${CYAN}$(hostname)${NC}"
+echo -e "IP: ${CYAN}$(hostname -I | awk '{print $1}')${NC}"
+echo -e "Timezone: ${CYAN}$timezone${NC}"
+echo -e "Usuário SSH: ${CYAN}supcip${NC}"
+echo -e "Editor: ${CYAN}Neovim (nvim)${NC}"
+echo -e "Zabbix Server: ${CYAN}200.187.67.220${NC}"
+echo -e "Chave SSH: ${CYAN}${SSH_KEY_PATH}${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo
+echo -e "${YELLOW}Próximos passos:${NC}"
+echo -e "1. ${CYAN}Teste a conexão SSH em outro terminal ANTES de reiniciar${NC}"
+echo -e "2. ${CYAN}Mantenha esta sessão aberta até confirmar o acesso${NC}"
+echo -e "3. ${CYAN}Reinicie o servidor para aplicar todas as configurações${NC}"
+echo
 
 ###Reiniciar o servidor###
-        echo -n "Você quer reiniciar o servidor agora? [Digite Sim ou Não]"
-                read reboot
-        echo "Você escolheu: $reboot"
-sleep   2
-if [ $reboot = Sim ]
-        then
-		echo "Reiniciando o servidor..."
-	sleep	2
-		reboot
-        else
-                echo "Lembre de reiniciar o servidor, para aplicar todas as configurações."
+log_warning "É necessário reiniciar o servidor para aplicar todas as configurações"
+echo -n "Deseja reiniciar agora? [Sim/Nao]: "
+read REBOOT_CONFIRM
+
+if [ "$REBOOT_CONFIRM" = "Sim" ]; then
+    log_info "Reiniciando servidor em 10 segundos..."
+    log_warning "CERTIFIQUE-SE DE TER BAIXADO A CHAVE SSH!"
+    sleep 10
+    reboot
+else
+    log_warning "Lembre-se de reiniciar o servidor manualmente!"
+    log_info "Para reiniciar: sudo reboot"
+    echo
+    log_info "Para testar SSH antes de reiniciar:"
+    echo -e "${CYAN}ssh -i ${SSH_KEY_NAME}.key supcip@$(hostname -I | awk '{print $1}')${NC}"
 fi
