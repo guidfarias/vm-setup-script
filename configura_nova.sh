@@ -195,50 +195,6 @@ EOF
     log_info "Melhorias no bash aplicadas"
 fi
 
-###Instalação do Zabbix###
-log_info "Instalando e configurando Zabbix Agent..."
-
-# Instalar Zabbix Agent 2 (versão mais recente)
-apt-get install -y zabbix-agent2 || {
-    log_warning "Falha ao instalar zabbix-agent2, tentando zabbix-agent..."
-    apt-get install -y zabbix-agent
-}
-
-# Configurar Zabbix
-ZABBIX_CONF="/etc/zabbix/zabbix_agent2.conf"
-if [ ! -f "$ZABBIX_CONF" ]; then
-    ZABBIX_CONF="/etc/zabbix/zabbix_agentd.conf"
-fi
-
-log_info "Configurando Zabbix Agent..."
-sed -i 's/^Server=.*/Server=200.187.67.220/' "$ZABBIX_CONF"
-sed -i 's/^ServerActive=.*/ServerActive=200.187.67.220/' "$ZABBIX_CONF"
-sed -i "s/^Hostname=.*/Hostname=$(hostname)/" "$ZABBIX_CONF"
-
-# Configurar firewall se existir
-if command -v firewall-cmd &> /dev/null; then
-    log_info "Configurando firewall para Zabbix..."
-    firewall-cmd --add-port=10050/tcp --permanent
-    firewall-cmd --reload
-    
-    if firewall-cmd --list-all | grep -q 10050; then
-        log_info "Regra de firewall criada com sucesso"
-    else
-        log_warning "Regra de firewall pode não ter sido criada corretamente"
-    fi
-elif command -v ufw &> /dev/null; then
-    log_info "Configurando UFW para Zabbix..."
-    ufw allow 10050/tcp
-    log_info "Regra UFW criada"
-else
-    log_warning "Nenhum firewall detectado (firewalld/ufw)"
-fi
-
-# Reiniciar serviço Zabbix
-systemctl restart zabbix-agent2 2>/dev/null || systemctl restart zabbix-agent
-systemctl enable zabbix-agent2 2>/dev/null || systemctl enable zabbix-agent
-log_info "Zabbix Agent configurado e iniciado"
-
 ###Fim da configuração###
 echo
 echo -e "${GREEN}========================================${NC}"
@@ -248,7 +204,6 @@ echo -e "Hostname: ${CYAN}$(hostname)${NC}"
 echo -e "IP: ${CYAN}$(hostname -I | awk '{print $1}')${NC}"
 echo -e "Timezone: ${CYAN}$timezone${NC}"
 echo -e "Editor: ${CYAN}Neovim (nvim) - Tema escuro minimalista${NC}"
-echo -e "Zabbix Server: ${CYAN}200.187.67.220${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo
 
