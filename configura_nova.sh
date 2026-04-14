@@ -57,6 +57,9 @@ timedatectl set-timezone America/Sao_Paulo
 timezone=$(timedatectl status | grep "Time zone" | awk '{print $3}')
 log_info "Timezone configurado: $timezone"
 
+log_info "Gerando locale en_GB.UTF-8..."
+locale-gen en_GB.UTF-8 || { log_error "Falha ao gerar locale en_GB.UTF-8"; exit 1; }
+
 log_info "Configurando formato de hora 24h..."
 localectl set-locale LC_TIME=en_GB.UTF-8
 log_info "Formato de hora configurado com sucesso"
@@ -76,11 +79,26 @@ apt-get install -y \
     unzip \
     gnupg \
     ca-certificates \
-    software-properties-common || {
+    software-properties-common \
+    ncdu \
+    iotop \
+    nmap \
+    bat \
+    ripgrep || {
     log_error "Falha na instalação de pacotes essenciais"
     exit 1
 }
 log_info "Pacotes essenciais instalados com sucesso"
+
+###Instalação do duf (df mais visual)###
+log_info "Instalando duf..."
+DUF_VERSION="0.8.1"
+DUF_ARCH="linux_amd64"
+wget -q "https://github.com/muesli/duf/releases/download/v${DUF_VERSION}/duf_${DUF_VERSION}_${DUF_ARCH}.deb" -O /tmp/duf.deb && \
+    dpkg -i /tmp/duf.deb && \
+    rm -f /tmp/duf.deb && \
+    log_info "duf instalado com sucesso" || \
+    log_warning "Falha ao instalar duf (não crítico, continuando...)"
 
 ###Configurações do Neovim###
 log_info "Configurando Neovim como editor padrão..."
@@ -185,6 +203,9 @@ alias df='df -h'
 alias free='free -h'
 alias ..='cd ..'
 alias ...='cd ../..'
+alias cat='batcat --paging=never'
+alias bat='batcat'
+alias rg='rg --smart-case'
 
 # History melhorado
 export HISTSIZE=10000
@@ -194,6 +215,18 @@ export HISTCONTROL=ignoredups:erasedups
 EOF
     log_info "Melhorias no bash aplicadas"
 fi
+
+###Copiar configurações para /etc/skel (novos usuários herdam)###
+log_info "Copiando configurações para /etc/skel/ (template de novos usuários)..."
+
+# Copiar config do Neovim
+mkdir -p /etc/skel/.config/nvim
+cp /root/.config/nvim/init.vim /etc/skel/.config/nvim/init.vim
+
+# Copiar .bashrc customizado
+cp /root/.bashrc /etc/skel/.bashrc
+
+log_info "Configurações copiadas para /etc/skel/ com sucesso"
 
 ###Fim da configuração###
 echo
@@ -210,7 +243,7 @@ echo
 ###Reiniciar o servidor###
 log_warning "É recomendado reiniciar o servidor para aplicar todas as configurações"
 echo -n "Deseja reiniciar agora? [Sim/Nao]: "
-read REBOOT_CONFIRM
+read -r REBOOT_CONFIRM || true
 
 if [ "$REBOOT_CONFIRM" = "Sim" ]; then
     log_info "Reiniciando servidor em 10 segundos..."
