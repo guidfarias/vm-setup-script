@@ -58,6 +58,7 @@ timezone=$(timedatectl status | grep "Time zone" | awk '{print $3}')
 log_info "Timezone configurado: $timezone"
 
 log_info "Gerando locale en_GB.UTF-8..."
+apt-get install -y locales || { log_error "Falha ao instalar pacote locales"; exit 1; }
 locale-gen en_GB.UTF-8 || { log_error "Falha ao gerar locale en_GB.UTF-8"; exit 1; }
 
 log_info "Configurando formato de hora 24h..."
