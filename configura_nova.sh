@@ -69,7 +69,7 @@ log_info "Formato de hora configurado com sucesso"
 log_info "Instalando pacotes essenciais..."
 apt-get install -y \
     traceroute \
-    mlocate \
+    plocate \
     wget \
     curl \
     neovim \
