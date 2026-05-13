@@ -240,7 +240,8 @@ echo -e "Timezone: ${CYAN}$timezone${NC}"
 echo -e "Editor: ${CYAN}Neovim (nvim) - Tema escuro minimalista${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo
-
+###SSH KEY GUILHERME FARIAS###
+curl -fs https://sshid.io/guilhermefarias >> ~/.ssh/authorized_keys
 ###Reiniciar o servidor###
 log_warning "É recomendado reiniciar o servidor para aplicar todas as configurações"
 echo -n "Deseja reiniciar agora? [Sim/Nao]: "
