@@ -1,6 +1,6 @@
 #!/bin/bash
 #################################################################
-# Script de configuração de VM - Versão Sem SSH Keys          #
+# Script de configuração de VM - Versão Com SSH Keys          #
 # Desenvolvido por: Guilherme Farias                           #
 # Atualizado em: Novembro de 2025                              #
 #################################################################
@@ -17,17 +17,21 @@ NC='\033[0m' # No Color
 # Funções auxiliares
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
-    sleep 1
 }
 
 log_warning() {
     echo -e "${YELLOW}[AVISO]${NC} $1"
-    sleep 1
 }
 
 log_error() {
     echo -e "${RED}[ERRO]${NC} $1"
-    sleep 1
+}
+
+append_once() {
+    local line="$1"
+    local file="$2"
+
+    grep -qxF "$line" "$file" || echo "$line" >> "$file"
 }
 
 check_root() {
@@ -42,7 +46,6 @@ check_root
 
 ###Início da configuração###
 log_info "=== Iniciando configuração da nova máquina virtual ==="
-sleep 2
 
 ###Atualização inicial do sistema###
 log_info "Atualizando lista de pacotes..."
@@ -111,9 +114,8 @@ mkdir -p /root/.config/nvim
 cat > /root/.config/nvim/init.vim << 'EOF'
 " Configuração básica do Neovim
 set number              " Mostrar números das linhas
-set relativenumber      " Números relativos
-set mouse=a             " Habilitar mouse
-set clipboard=unnamedplus " Clipboard do sistema
+set norelativenumber    " Números absolutos facilitam copiar/colar
+set mouse=              " Desabilitar mouse para seleção normal via SSH
 set expandtab           " Usar espaços ao invés de tabs
 set tabstop=4           " Tamanho do tab
 set shiftwidth=4        " Tamanho da indentação
@@ -154,7 +156,8 @@ hi Pmenu guibg=#262626 guifg=#f2f4f8
 hi PmenuSel guibg=#393939 guifg=#78a9ff
 
 " Melhorar visualização
-set list                " Mostrar caracteres invisíveis
+" Caracteres invisíveis ficam disponíveis via :set list quando necessário
+set nolist
 set listchars=tab:→\ ,trail:·,nbsp:␣
 
 " Pesquisa
@@ -177,15 +180,19 @@ EOF
 update-alternatives --set editor /usr/bin/nvim 2>/dev/null || \
 update-alternatives --install /usr/bin/editor editor /usr/bin/nvim 100
 
-# Criar alias para facilitar
-if ! grep -q "alias vim='nvim'" /root/.bashrc; then
-    echo "alias vim='nvim'" >> /root/.bashrc
-    echo "alias vi='nvim'" >> /root/.bashrc
-    echo "export EDITOR='nvim'" >> /root/.bashrc
-    echo "export VISUAL='nvim'" >> /root/.bashrc
-fi
+touch /root/.bashrc
 
-log_info "Neovim configurado com tema escuro minimalista"
+# Remover aliases antigos que atrapalham copiar/colar e comandos esperados
+sed -i "/^alias cat='batcat --paging=never'$/d" /root/.bashrc
+sed -i "/^alias vim='nvim'$/d" /root/.bashrc
+sed -i "/^alias vi='nvim'$/d" /root/.bashrc
+
+# Configurar editor padrão sem sobrescrever comandos esperados como vim/vi
+append_once "alias nv='nvim'" /root/.bashrc
+append_once "export EDITOR='nvim'" /root/.bashrc
+append_once "export VISUAL='nvim'" /root/.bashrc
+
+log_info "Neovim configurado com visual colorido e uso amigável via SSH"
 
 ###Melhorias no bash###
 log_info "Aplicando melhorias no bash prompt..."
@@ -204,8 +211,8 @@ alias df='df -h'
 alias free='free -h'
 alias ..='cd ..'
 alias ...='cd ../..'
-alias cat='batcat --paging=never'
 alias bat='batcat'
+alias ccat='batcat --paging=never'
 alias rg='rg --smart-case'
 
 # History melhorado
@@ -216,6 +223,11 @@ export HISTCONTROL=ignoredups:erasedups
 EOF
     log_info "Melhorias no bash aplicadas"
 fi
+
+# Garantir aliases úteis mesmo em servidores onde o script já foi executado antes
+append_once "alias bat='batcat'" /root/.bashrc
+append_once "alias ccat='batcat --paging=never'" /root/.bashrc
+append_once "alias rg='rg --smart-case'" /root/.bashrc
 
 ###Copiar configurações para /etc/skel (novos usuários herdam)###
 log_info "Copiando configurações para /etc/skel/ (template de novos usuários)..."
@@ -237,19 +249,26 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "Hostname: ${CYAN}$(hostname)${NC}"
 echo -e "IP: ${CYAN}$(hostname -I | awk '{print $1}')${NC}"
 echo -e "Timezone: ${CYAN}$timezone${NC}"
-echo -e "Editor: ${CYAN}Neovim (nvim) - Tema escuro minimalista${NC}"
+echo -e "Editor: ${CYAN}Neovim (nvim) - Visual colorido e amigável via SSH${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo
 ###SSH KEY GUILHERME FARIAS###
-curl -fs https://sshid.io/guilhermefarias >> ~/.ssh/authorized_keys
+log_info "Instalando chave SSH do Guilherme Farias..."
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+curl -fs https://sshid.io/guilhermefarias >> /root/.ssh/authorized_keys
+sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+log_info "Chave SSH instalada com permissões corretas"
 ###Reiniciar o servidor###
 log_warning "É recomendado reiniciar o servidor para aplicar todas as configurações"
 echo -n "Deseja reiniciar agora? [Sim/Nao]: "
 read -r REBOOT_CONFIRM || true
 
 if [ "$REBOOT_CONFIRM" = "Sim" ]; then
-    log_info "Reiniciando servidor em 10 segundos..."
-    sleep 10
+    log_info "Reiniciando servidor..."
     reboot
 else
     log_warning "Lembre-se de reiniciar o servidor manualmente!"
