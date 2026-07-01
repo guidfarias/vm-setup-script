@@ -31,8 +31,10 @@ set -euo pipefail
 
 RESTIC_VERSION="0.17.3"
 GITHUB_RAW="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/configura_backup.sh"
+GITHUB_RAW_RR="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/rr.sh"
 
 SCRIPT_DEST="/usr/local/bin/restic-backup.sh"
+RR_DEST="/usr/local/bin/rr"
 ENV_DIR="/etc/restic"
 ENV_FILE="${ENV_DIR}/env"
 CRON_FILE="/etc/cron.d/restic-backup"
@@ -163,6 +165,15 @@ install_backup_script() {
     chmod +x "${SCRIPT_DEST}"
     bash -n "${SCRIPT_DEST}" || die "O script baixado tem erro de sintaxe. Abortando."
     log_info "Script instalado em ${SCRIPT_DEST} (sintaxe OK)."
+
+    # Wrapper 'rr': permite rodar 'rr snapshots' sem exportar variáveis à mão.
+    if curl -fsSL "${GITHUB_RAW_RR}" -o "${RR_DEST}" && bash -n "${RR_DEST}"; then
+        chmod +x "${RR_DEST}"
+        log_info "Wrapper 'rr' instalado em ${RR_DEST} (use: rr snapshots)."
+    else
+        log_warn "Não foi possível instalar o wrapper 'rr' (não crítico)."
+        rm -f "${RR_DEST}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -335,6 +346,7 @@ print_final() {
     echo -e "Script:      ${CYAN}${SCRIPT_DEST}${NC}"
     echo -e "Env:         ${CYAN}${ENV_FILE}${NC}"
     echo -e "Cron:        ${CYAN}${CRON_FILE} (${CRON_SCHEDULE})${NC}"
+    [[ -x "${RR_DEST}" ]] && echo -e "Wrapper:     ${CYAN}${RR_DEST}  (ex.: rr snapshots)${NC}"
     echo
 
     if [[ "${ENV_IS_TEMPLATE:-false}" == "true" ]]; then
@@ -343,6 +355,7 @@ print_final() {
         echo -e "   2. Rode de novo p/ aplicar lifecycle e 1º backup:"
         echo -e "                               ${CYAN}sudo bash $0${NC}"
     else
+        echo -e "Listar snapshots:                ${CYAN}rr snapshots${NC}"
         echo -e "Teste de restore quando quiser:  ${CYAN}${SCRIPT_DEST} --test-restore${NC}"
     fi
     echo
