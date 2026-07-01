@@ -4,7 +4,9 @@
 # RunCloud / CIPNET
 #
 # Roda UMA vez por servidor. Faz tudo que antes era manual:
-#   1. Instala dependências: mysql-client, gzip, tar, bzip2, unzip, curl
+#   1. Verifica utilitários (gzip, tar, bzip2, unzip, curl) e cliente de banco.
+#      NÃO instala 'mysql-client' (Oracle) — usa 'mariadb-client' se faltar, e
+#      não mexe em nada se o cliente já existir (caso do RunCloud).
 #   2. Instala AWS CLI v2 (instalador oficial)
 #   3. Instala restic ${RESTIC_VERSION} (versão fixada e testada)
 #   4. Baixa o restic-backup.sh para /usr/local/bin/
@@ -98,12 +100,82 @@ log_info "Arquitetura detectada: ${ARCH} → restic_${RESTIC_ARCH}"
 # ---------------------------------------------------------------------------
 
 install_system_packages() {
-    log_step "1/8 — Instalando pacotes do sistema"
+    log_step "1/8 — Verificando pacotes do sistema"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y mysql-client gzip tar bzip2 unzip curl ca-certificates \
-        || die "Falha ao instalar pacotes do sistema."
-    log_info "Pacotes do sistema instalados."
+
+    # ⚠️ NUNCA instalar 'mysql-client' (pacote da Oracle, MySQL 8.0). Em
+    # servidores MariaDB (RunCloud usa MariaDB) esse pacote CONFLITA: quebra a
+    # detecção de versão do agente RunCloud e pode deixar o banco sem os
+    # binários de cliente. O cliente correto do MariaDB é 'mariadb-client'.
+    #
+    # Estratégia segura:
+    #   1. Se 'mysqldump' e 'mysql' já existem, não instala NADA de banco
+    #      (RunCloud já traz o cliente MariaDB).
+    #   2. Só instala os utilitários que realmente faltam (gzip, tar, ...).
+    #   3. Só chama 'apt-get' se houver algo faltando.
+
+    ensure_db_client
+
+    # Utilitários necessários → pacote que os fornece.
+    # Para estes utilitários o nome do comando == nome do pacote no apt.
+    local util_cmds="gzip tar bzip2 unzip curl"
+    local missing=()
+    local cmd
+    for cmd in ${util_cmds}; do
+        command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
+    done
+    # ca-certificates não tem um binário próprio; verifica pelo dpkg.
+    if ! dpkg -s ca-certificates &>/dev/null; then
+        missing+=("ca-certificates")
+    fi
+
+    if (( ${#missing[@]} == 0 )); then
+        log_info "Todos os utilitários já presentes. Nenhuma instalação de pacote necessária."
+        return 0
+    fi
+
+    log_info "Instalando utilitários faltantes: ${missing[*]}"
+    apt-get update -y || log_warn "apt-get update falhou (seguindo mesmo assim)."
+    apt-get install -y "${missing[@]}" \
+        || die "Falha ao instalar utilitários: ${missing[*]}"
+    log_info "Utilitários instalados."
+}
+
+# Garante um cliente MySQL/MariaDB (mysqldump + mysql) SEM instalar o pacote
+# 'mysql-client' da Oracle. Prioriza NÃO mexer em nada se já houver cliente.
+ensure_db_client() {
+    if command -v mysqldump &>/dev/null && command -v mysql &>/dev/null; then
+        log_info "Cliente de banco já presente ($(command -v mysqldump)). Nada a instalar."
+        return 0
+    fi
+
+    log_warn "Cliente de banco (mysqldump/mysql) ausente."
+
+    # Detecta se o servidor é MariaDB (RunCloud) para instalar o cliente CERTO.
+    local is_mariadb="false"
+    if dpkg -l 2>/dev/null | grep -qiE '^ii\s+mariadb-(server|server-core|common)'; then
+        is_mariadb="true"
+    elif command -v mariadbd &>/dev/null || [[ -x /usr/sbin/mariadbd ]]; then
+        is_mariadb="true"
+    fi
+
+    if [[ "${is_mariadb}" == "true" ]]; then
+        log_info "Servidor MariaDB detectado. Instalando 'mariadb-client' (cliente correto)."
+        apt-get update -y || log_warn "apt-get update falhou (seguindo mesmo assim)."
+        apt-get install -y mariadb-client \
+            || die "Falha ao instalar mariadb-client. Instale manualmente: apt-get install -y mariadb-client"
+    else
+        # Sem MariaDB detectado: ainda assim NÃO usamos 'mysql-client' (Oracle).
+        # Preferimos 'mariadb-client', que é compatível e não conflita.
+        log_warn "MariaDB não detectado. Instalando 'mariadb-client' (compatível, evita conflito com Oracle mysql-client)."
+        apt-get update -y || log_warn "apt-get update falhou (seguindo mesmo assim)."
+        apt-get install -y mariadb-client \
+            || die "Falha ao instalar cliente de banco. Instale manualmente: apt-get install -y mariadb-client"
+    fi
+
+    command -v mysqldump &>/dev/null \
+        || die "mysqldump ainda ausente após instalação. Verifique manualmente."
+    log_info "Cliente de banco instalado: $(command -v mysqldump)"
 }
 
 # ---------------------------------------------------------------------------
