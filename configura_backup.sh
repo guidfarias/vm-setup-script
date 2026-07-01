@@ -90,6 +90,35 @@ ARCHIVE_KEEP_WEEKS="${ARCHIVE_KEEP_WEEKS:-4}"
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 
 # ---------------------------------------------------------------------------
+# STATUS PARA MONITORAMENTO (JSON gravado no S3 em Monitoramento/<host>.json)
+# ---------------------------------------------------------------------------
+# Preenchido ao longo da execução e gravado SEMPRE no final (sucesso ou falha),
+# inclusive em falha precoce. O MCP/painel lê esses JSONs para ver a frota sem
+# conectar em servidor nenhum. Arquivo local de status (fallback / auditoria):
+STATUS_LOCAL_FILE="${STATUS_LOCAL_FILE:-/var/log/restic-status.json}"
+# Prefixo (pasta) no S3 onde os JSONs de status são gravados.
+STATUS_S3_PREFIX="${STATUS_S3_PREFIX:-Monitoramento}"
+STATUS_SCRIPT_VERSION="2026-07"
+
+STATUS_STARTED_AT=""          # ISO8601 do início
+STATUS_DB_OK=0
+STATUS_DB_FAIL=0
+STATUS_ARCHIVE_RAN="false"
+STATUS_ARCHIVE_APPS_OK=0
+STATUS_ARCHIVE_APPS_FAIL=0
+STATUS_SNAPSHOT_ID=""
+STATUS_REPO_SIZE=""
+STATUS_SNAPSHOTS_TOTAL=""
+STATUS_CHECK_RAN="false"
+STATUS_ERRORS=()              # array de mensagens de erro/aviso relevantes
+STATUS_WRITTEN="false"        # evita escrever duas vezes
+
+# Registra uma mensagem no array de erros do status (para o JSON).
+status_add_error() {
+    STATUS_ERRORS+=("$*")
+}
+
+# ---------------------------------------------------------------------------
 # ESTADO INTERNO / LIMPEZA
 # ---------------------------------------------------------------------------
 
@@ -102,6 +131,21 @@ cleanup() {
     # do último comando aqui viraria o exit do script. `return 0` garante que
     # um backup bem-sucedido não seja reportado como falha ao cron.
     local exit_code=$?
+
+    # Publica o status de monitoramento SEMPRE (sucesso, falha parcial ou falha
+    # precoce). Classificação:
+    #   - exit != 0                    → "error"   (abortou; ex.: restic ausente)
+    #   - exit == 0 mas houve erros    → "partial" (ex.: 1 banco falhou no dump)
+    #   - exit == 0 e sem erros        → "success"
+    # write_status é no-op em dry-run/test-restore e nunca deixa o script falhar.
+    local overall="success"
+    if (( exit_code != 0 )); then
+        overall="error"
+    elif (( ${#STATUS_ERRORS[@]} > 0 )); then
+        overall="partial"
+    fi
+    write_status "${overall}" || true
+
     [[ -n "${EXCLUDE_FILE}" ]]        && rm -f "${EXCLUDE_FILE}"
     [[ -n "${MYSQL_DEFAULTS_FILE}" ]] && rm -f "${MYSQL_DEFAULTS_FILE}"
     [[ -n "${RESTORE_TEST_DIR}" ]]    && rm -rf "${RESTORE_TEST_DIR}"
@@ -136,6 +180,7 @@ error() { log "ERROR" "$@"; }
 
 die() {
     error "$@"
+    status_add_error "$*"
     notify_failure "$*"
     exit 1
 }
@@ -420,10 +465,14 @@ dump_databases() {
             ok=$((ok + 1))
         else
             error "Falha no dump do banco: ${db} (rc=${dump_rc})"
+            status_add_error "dump falhou: ${db} (rc=${dump_rc})"
             rm -f "${dump_file}"
             fail=$((fail + 1))
         fi
     done <<< "${db_list}"
+
+    STATUS_DB_OK=${ok}
+    STATUS_DB_FAIL=${fail}
 
     info "Dump finalizado: ${ok} banco(s) OK, ${fail} falha(s)."
 
@@ -516,6 +565,11 @@ run_backup() {
 
     restic "${restic_flags[@]}" || die "Snapshot restic falhou."
     info "Backup restic finalizado com sucesso."
+
+    # Captura o ID do snapshot recém-criado (para o status). Falha aqui não é
+    # crítica — é só metadado de monitoramento.
+    STATUS_SNAPSHOT_ID="$(restic snapshots latest --json 2>/dev/null \
+        | grep -o '"short_id":"[^"]*"' | tail -1 | cut -d'"' -f4 || true)"
 }
 
 # ---------------------------------------------------------------------------
@@ -545,6 +599,8 @@ run_weekly_app_archives() {
         warn "aws cli não encontrado. Pulando compactados semanais."
         return 0
     }
+
+    STATUS_ARCHIVE_RAN="true"
 
     local today base_s3_path
     today="$(date '+%Y-%m-%d')"
@@ -604,9 +660,13 @@ run_weekly_app_archives() {
             app_count=$((app_count + 1))
         else
             warn "Falha ao compactar/enviar: ${app_path} (tar=${rc[0]}, aws=${rc[1]})"
+            status_add_error "archive falhou: ${owner_name}-${app_name} (tar=${rc[0]}, aws=${rc[1]})"
             fail_count=$((fail_count + 1))
         fi
     done < <(find "${BACKUP_SOURCE}" -mindepth 3 -maxdepth 3 -type d -path "${BACKUP_SOURCE}/*/webapps/*" | sort)
+
+    STATUS_ARCHIVE_APPS_OK=${app_count}
+    STATUS_ARCHIVE_APPS_FAIL=${fail_count}
 
     info "Backup compactado semanal finalizado: ${app_count} aplicação(ões) OK, ${fail_count} falha(s)."
 
@@ -659,8 +719,11 @@ run_check() {
             return 0
         fi
 
-        restic check --read-data-subset="${CHECK_DATA_SUBSET}" \
-            || warn "restic check encontrou problemas. Rode 'restic check --read-data' completo se necessário."
+        STATUS_CHECK_RAN="true"
+        if ! restic check --read-data-subset="${CHECK_DATA_SUBSET}"; then
+            warn "restic check encontrou problemas. Rode 'restic check --read-data' completo se necessário."
+            status_add_error "restic check encontrou problemas"
+        fi
 
         info "Check finalizado."
     else
@@ -731,6 +794,110 @@ run_test_restore() {
 print_summary() {
     info "Resumo dos snapshots:"
     restic snapshots --compact || true
+
+    # Coleta métricas do repositório para o status (não crítico se falhar).
+    STATUS_SNAPSHOTS_TOTAL="$(restic snapshots --json 2>/dev/null \
+        | grep -o '"short_id"' | wc -l | tr -d ' ' || true)"
+    STATUS_REPO_SIZE="$(restic stats --mode raw-data 2>/dev/null \
+        | grep -i 'Total Size' | sed 's/.*:[[:space:]]*//' || true)"
+}
+
+# ---------------------------------------------------------------------------
+# STATUS JSON — grava o resultado do backup localmente e no S3
+# ---------------------------------------------------------------------------
+
+# Escapa uma string para uso seguro dentro de JSON (aspas, barra, controles).
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"   # barra invertida primeiro
+    s="${s//\"/\\\"}"   # aspas
+    s="${s//$'\t'/\\t}" # tab
+    s="${s//$'\r'/\\r}" # CR
+    s="${s//$'\n'/\\n}" # LF
+    printf '%s' "${s}"
+}
+
+# Monta o array JSON de erros a partir de STATUS_ERRORS[].
+build_errors_json() {
+    local out="[" first=true e
+    for e in "${STATUS_ERRORS[@]+"${STATUS_ERRORS[@]}"}"; do
+        [[ "${first}" == "true" ]] && first=false || out+=","
+        out+="\"$(json_escape "${e}")\""
+    done
+    out+="]"
+    printf '%s' "${out}"
+}
+
+# Grava o JSON de status. Chamada SEMPRE no final (trap), com o status derivado
+# do código de saída. Grava sempre o arquivo local; tenta o S3 se possível.
+# $1 = "success" | "partial" | "error"
+write_status() {
+    [[ "${STATUS_WRITTEN}" == "true" ]] && return 0
+    STATUS_WRITTEN="true"
+
+    # Em modo dry-run ou test-restore não faz sentido publicar status de backup.
+    [[ "${DRY_RUN}" == "true" ]] && return 0
+    [[ "${TEST_RESTORE}" == "true" ]] && return 0
+
+    local overall="$1"
+    local host finished_at started errors_json
+    host="$(hostname -s)"
+    finished_at="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    started="${STATUS_STARTED_AT:-${finished_at}}"
+    errors_json="$(build_errors_json)"
+
+    # duração em segundos (se conseguimos parsear started).
+    local dur="null" s_epoch f_epoch
+    s_epoch="$(date -d "${started}" +%s 2>/dev/null || echo "")"
+    f_epoch="$(date -d "${finished_at}" +%s 2>/dev/null || echo "")"
+    if [[ -n "${s_epoch}" && -n "${f_epoch}" ]]; then
+        dur=$(( f_epoch - s_epoch ))
+    fi
+
+    local json
+    json="$(cat <<JSON
+{
+  "host": "$(json_escape "${host}")",
+  "status": "$(json_escape "${overall}")",
+  "started_at": "$(json_escape "${started}")",
+  "finished_at": "$(json_escape "${finished_at}")",
+  "duration_seconds": ${dur},
+  "databases": { "ok": ${STATUS_DB_OK}, "failed": ${STATUS_DB_FAIL} },
+  "weekly_archive": { "ran": ${STATUS_ARCHIVE_RAN}, "apps_ok": ${STATUS_ARCHIVE_APPS_OK}, "apps_failed": ${STATUS_ARCHIVE_APPS_FAIL} },
+  "restic_snapshot_id": "$(json_escape "${STATUS_SNAPSHOT_ID}")",
+  "repo_size": "$(json_escape "${STATUS_REPO_SIZE}")",
+  "snapshots_total": "$(json_escape "${STATUS_SNAPSHOTS_TOTAL}")",
+  "check_ran": ${STATUS_CHECK_RAN},
+  "errors": ${errors_json},
+  "script_version": "$(json_escape "${STATUS_SCRIPT_VERSION}")"
+}
+JSON
+)"
+
+    # 1) Grava sempre o arquivo local (auditoria / fallback).
+    local status_dir
+    status_dir="$(dirname "${STATUS_LOCAL_FILE}")"
+    [[ -d "${status_dir}" ]] || mkdir -p "${status_dir}" 2>/dev/null || true
+    printf '%s\n' "${json}" > "${STATUS_LOCAL_FILE}" 2>/dev/null || true
+
+    # 2) Tenta enviar ao S3 (só se houver aws + credenciais + bucket).
+    #    Exporta as credenciais aqui também: em falha PRECOCE (ex.: restic
+    #    ausente, que aborta antes de export_restic_env), as variáveis foram
+    #    lidas pelo source do env mas ainda não estavam exportadas para o aws.
+    if command -v aws &>/dev/null \
+        && [[ -n "${S3_BUCKET}" && -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+        export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
+        local s3_dest="s3://${S3_BUCKET}/${STATUS_S3_PREFIX}/${host}.json"
+        if printf '%s\n' "${json}" | aws s3 cp - "${s3_dest}" \
+            --content-type "application/json" \
+            --region "${AWS_DEFAULT_REGION}" &>/dev/null; then
+            info "Status publicado no S3: ${s3_dest}"
+        else
+            warn "Não foi possível publicar o status no S3 (backup em si não é afetado)."
+        fi
+    else
+        warn "Status gravado apenas localmente em ${STATUS_LOCAL_FILE} (aws/credenciais indisponíveis)."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -738,6 +905,10 @@ print_summary() {
 # ---------------------------------------------------------------------------
 
 main() {
+    # Marca o início o quanto antes, para o status ter timestamp mesmo se algo
+    # falhar já no carregamento do env.
+    STATUS_STARTED_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
     # Carrega o env PRIMEIRO: ele pode redefinir LOG_FILE e LOCK_FILE, que são
     # usados logo abaixo por rotate_log e acquire_lock.
     load_env_file
