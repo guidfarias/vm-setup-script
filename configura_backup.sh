@@ -1,22 +1,31 @@
 #!/bin/bash
 # =============================================================================
-# restic-backup.sh — Backup completo de /home para S3
+# restic-backup.sh — Backup completo de /home para S3 (restic + tar.gz)
 # RunCloud / CIPNET
 #
 # O que este script faz:
-#   1. Carrega variáveis de /etc/restic/env
-#   2. Valida pré-requisitos
-#   3. Faz dump de todos os bancos MySQL em /home/backups/db
+#   1. Carrega variáveis de /etc/restic/env (valida permissões 600/root)
+#   2. Valida pré-requisitos (binários, credenciais, espaço em disco)
+#   3. Faz dump de todos os bancos MySQL em ${DB_DUMP_DIR}
+#      (credenciais via arquivo temporário — NÃO vazam no `ps aux`)
 #   4. Faz backup incremental do /home completo com restic
-#   5. Gera .tar.gz por aplicação e envia ao S3 (sextas ou FORCE_ARCHIVE=true)
-#   6. Aplica retenção
-#   7. Executa check semanal de integridade
+#   5. Gera .tar.gz por aplicação e envia ao S3 (dia configurável / FORCE_ARCHIVE)
+#   6. Aplica retenção (forget --prune)
+#   7. Executa check de integridade semanal
+#   8. (Opcional) Testa restore de amostra: --test-restore
 #
 # Uso:
-#   bash restic-backup.sh
-#   bash restic-backup.sh --dry-run
-#   bash restic-backup.sh --check
+#   bash restic-backup.sh                  # backup normal
+#   bash restic-backup.sh --dry-run        # simula, nada é enviado
+#   bash restic-backup.sh --check          # força check de integridade
+#   bash restic-backup.sh --test-restore   # testa restauração de amostra
 #   FORCE_ARCHIVE=true bash restic-backup.sh
+#
+# ⚠️  IMPORTANTE — RECUPERAÇÃO DE DESASTRE:
+#   A RESTIC_PASSWORD é a ÚNICA forma de ler os backups restic. Se o servidor
+#   for perdido/reprovisionado e você não tiver essa senha guardada EM OUTRO
+#   LUGAR (gerenciador de senhas, cofre, etc.), TODOS os backups restic ficam
+#   irrecuperáveis. Guarde-a fora do servidor. O mesmo vale para as chaves AWS.
 # =============================================================================
 
 set -euo pipefail
@@ -37,6 +46,9 @@ RESTIC_S3_PREFIX="${RESTIC_S3_PREFIX:-Restic/${S3_PREFIX}}"
 
 RESTIC_PASSWORD="${RESTIC_PASSWORD:-}"
 
+# Diretório de origem do backup (permite testar sem tocar em /home real)
+BACKUP_SOURCE="${BACKUP_SOURCE:-/home}"
+
 DB_DUMP_DIR="${DB_DUMP_DIR:-/home/backups/db}"
 
 MYSQL_USER="${MYSQL_USER:-root}"
@@ -48,13 +60,21 @@ KEEP_WEEKLY="${KEEP_WEEKLY:-2}"
 KEEP_MONTHLY="${KEEP_MONTHLY:-2}"
 
 CHECK_DAY="${CHECK_DAY:-0}"
-CHECK_DATA_SUBSET="${CHECK_DATA_SUBSET:-5G}"
+# Aceita valor fixo (ex.: 5G) ou percentual (ex.: 10%). Percentual escala com o repo.
+CHECK_DATA_SUBSET="${CHECK_DATA_SUBSET:-10%}"
+
+# Espaço livre mínimo (em MB) exigido em DB_DUMP_DIR antes de dumpar os bancos.
+MIN_FREE_MB="${MIN_FREE_MB:-2048}"
 
 LOG_FILE="${LOG_FILE:-/var/log/restic-backup.log}"
-LOG_MAX_LINES=5000
+LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
+
+# Lock para evitar duas execuções simultâneas (cron sobreposto).
+LOCK_FILE="${LOCK_FILE:-/var/run/restic-backup.lock}"
 
 DRY_RUN=false
 FORCE_CHECK=false
+TEST_RESTORE=false
 
 ENABLE_WEEKLY_ARCHIVES="${ENABLE_WEEKLY_ARCHIVES:-true}"
 ARCHIVE_DAY="${ARCHIVE_DAY:-5}"
@@ -62,22 +82,63 @@ ARCHIVE_S3_PREFIX="${ARCHIVE_S3_PREFIX:-Snapshots}"
 ARCHIVE_KEEP_WEEKS="${ARCHIVE_KEEP_WEEKS:-4}"
 
 # ---------------------------------------------------------------------------
+# ALERTAS (opcional) — Healthchecks.io (dead man's switch)
+# ---------------------------------------------------------------------------
+# Defina HEALTHCHECK_URL no /etc/restic/env para ativar. Deixe vazio p/ desligar.
+# O script sinaliza início (/start), sucesso e falha (/fail) automaticamente.
+# É a forma mais confiável de descobrir que o backup PAROU de rodar.
+HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
+
+# ---------------------------------------------------------------------------
+# ESTADO INTERNO / LIMPEZA
+# ---------------------------------------------------------------------------
+
+EXCLUDE_FILE=""
+MYSQL_DEFAULTS_FILE=""
+RESTORE_TEST_DIR=""
+
+cleanup() {
+    # Preserva o código de saída original: como este é o trap de EXIT, o status
+    # do último comando aqui viraria o exit do script. `return 0` garante que
+    # um backup bem-sucedido não seja reportado como falha ao cron.
+    local exit_code=$?
+    [[ -n "${EXCLUDE_FILE}" ]]        && rm -f "${EXCLUDE_FILE}"
+    [[ -n "${MYSQL_DEFAULTS_FILE}" ]] && rm -f "${MYSQL_DEFAULTS_FILE}"
+    [[ -n "${RESTORE_TEST_DIR}" ]]    && rm -rf "${RESTORE_TEST_DIR}"
+    return "${exit_code}"
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
 # FUNÇÕES DE LOG
 # ---------------------------------------------------------------------------
 
 log() {
-    local level="$1"
-    shift
+    local level="$1"; shift
     local msg="$*"
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "${ts} [${level}] ${msg}" | tee -a "${LOG_FILE}"
+    # Garante que o diretório do log exista antes do primeiro write. Se o log
+    # não for gravável, ainda mostra no stdout/stderr (não deixa o backup mudo).
+    local logdir
+    logdir="$(dirname "${LOG_FILE}")"
+    [[ -d "${logdir}" ]] || mkdir -p "${logdir}" 2>/dev/null || true
+    if [[ -w "${logdir}" || -w "${LOG_FILE}" ]]; then
+        echo "${ts} [${level}] ${msg}" | tee -a "${LOG_FILE}"
+    else
+        echo "${ts} [${level}] ${msg}"
+    fi
 }
 
 info()  { log "INFO " "$@"; }
 warn()  { log "WARN " "$@"; }
 error() { log "ERROR" "$@"; }
-die()   { error "$@"; exit 1; }
+
+die() {
+    error "$@"
+    notify_failure "$*"
+    exit 1
+}
 
 rotate_log() {
     if [[ -f "${LOG_FILE}" ]]; then
@@ -91,85 +152,147 @@ rotate_log() {
 }
 
 # ---------------------------------------------------------------------------
+# ALERTAS — helpers Healthchecks.io (no-op se HEALTHCHECK_URL vazio)
+# ---------------------------------------------------------------------------
+
+notify_start() {
+    [[ -z "${HEALTHCHECK_URL}" ]] && return 0
+    command -v curl &>/dev/null || return 0
+    curl -fsS -m 10 --retry 3 "${HEALTHCHECK_URL}/start" &>/dev/null || true
+}
+
+notify_success() {
+    [[ -z "${HEALTHCHECK_URL}" ]] && return 0
+    command -v curl &>/dev/null || return 0
+    curl -fsS -m 10 --retry 3 "${HEALTHCHECK_URL}" &>/dev/null || true
+}
+
+notify_failure() {
+    [[ -z "${HEALTHCHECK_URL}" ]] && return 0
+    command -v curl &>/dev/null || return 0
+    # Envia a mensagem de erro no corpo (aparece no painel do Healthchecks).
+    curl -fsS -m 10 --retry 3 --data-raw "${1:-falha}" \
+        "${HEALTHCHECK_URL}/fail" &>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # ARGUMENTOS
 # ---------------------------------------------------------------------------
 
 for arg in "$@"; do
     case "${arg}" in
-        --dry-run) DRY_RUN=true ;;
-        --check)   FORCE_CHECK=true ;;
+        --dry-run)      DRY_RUN=true ;;
+        --check)        FORCE_CHECK=true ;;
+        --test-restore) TEST_RESTORE=true ;;
         --help|-h)
-            echo "Uso:"
-            echo "  bash restic-backup.sh"
-            echo "  bash restic-backup.sh --dry-run"
-            echo "  bash restic-backup.sh --check"
-            echo "  FORCE_ARCHIVE=true bash restic-backup.sh"
+            cat <<'HELP'
+Uso:
+  bash restic-backup.sh                  # backup normal
+  bash restic-backup.sh --dry-run        # simula, nada é enviado ao S3
+  bash restic-backup.sh --check          # força check de integridade
+  bash restic-backup.sh --test-restore   # testa restauração de amostra e sai
+  FORCE_ARCHIVE=true bash restic-backup.sh
+HELP
             exit 0
             ;;
-        *) die "Argumento desconhecido: ${arg}" ;;
+        *)
+            echo "Argumento desconhecido: ${arg}" >&2
+            exit 1
+            ;;
     esac
 done
 
 # ---------------------------------------------------------------------------
-# CARREGA VARIÁVEIS EXTERNAS
+# CARREGA VARIÁVEIS EXTERNAS (com verificação de segurança das permissões)
 # ---------------------------------------------------------------------------
 
-if [[ -f "${RESTIC_ENV_FILE}" ]]; then
+load_env_file() {
+    if [[ ! -f "${RESTIC_ENV_FILE}" ]]; then
+        warn "Arquivo ${RESTIC_ENV_FILE} não encontrado. Usando variáveis do ambiente."
+        return 0
+    fi
+
+    # O env contém a senha do root do MySQL e a RESTIC_PASSWORD.
+    # Recusa carregar se estiver legível por outros usuários.
+    # Suporta stat do GNU (Linux, -c) e do BSD (macOS, -f).
+    local perms owner
+    perms="$(stat -c '%a' "${RESTIC_ENV_FILE}" 2>/dev/null \
+             || stat -f '%Lp' "${RESTIC_ENV_FILE}" 2>/dev/null \
+             || echo '???')"
+    owner="$(stat -c '%U' "${RESTIC_ENV_FILE}" 2>/dev/null \
+             || stat -f '%Su' "${RESTIC_ENV_FILE}" 2>/dev/null \
+             || echo '???')"
+
+    if [[ "${perms}" == "???" ]]; then
+        warn "Não foi possível verificar permissões de ${RESTIC_ENV_FILE} (stat indisponível). Prosseguindo."
+    elif [[ "${perms}" != "600" && "${perms}" != "400" ]]; then
+        die "Permissões inseguras em ${RESTIC_ENV_FILE} (${perms}). Corrija com: chmod 600 ${RESTIC_ENV_FILE}"
+    fi
+    if [[ "${owner}" != "???" && "${owner}" != "root" && "${owner}" != "$(id -un)" ]]; then
+        warn "Dono de ${RESTIC_ENV_FILE} é '${owner}' (esperado root)."
+    fi
+
     # shellcheck source=/dev/null
     source "${RESTIC_ENV_FILE}"
-    info "Variáveis carregadas de ${RESTIC_ENV_FILE}"
-else
-    warn "Arquivo ${RESTIC_ENV_FILE} não encontrado. Usando variá[118;1:3uveis do ambiente."
-fi
+
+    # Reaplica defaults para variáveis que o env pode ter deixado vazias.
+    AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-sa-east-1}"
+    CHECK_DATA_SUBSET="${CHECK_DATA_SUBSET:-10%}"
+
+    info "Variáveis carregadas de ${RESTIC_ENV_FILE} (perms ${perms}, dono ${owner})"
+}
 
 # ---------------------------------------------------------------------------
 # VALIDAÇÕES
 # ---------------------------------------------------------------------------
 
+require_cmd() {
+    # require_cmd <binário> <dica de instalação>
+    if ! command -v "$1" &>/dev/null; then
+        error "'$1' não encontrado. ${2:-}"
+        return 1
+    fi
+    return 0
+}
+
 validate_env() {
     local errors=0
 
-    command -v restic &>/dev/null || {
-        error "restic não encontrado. Instale: ver documentação."
-        ((++errors))
-    }
+    require_cmd restic    "Instale o restic (https://restic.net)."           || errors=$((errors + 1))
+    require_cmd mysqldump "apt install mysql-client -y"                       || errors=$((errors + 1))
+    require_cmd mysql     "apt install mysql-client -y"                       || errors=$((errors + 1))
+    require_cmd gzip      "apt install gzip -y"                               || errors=$((errors + 1))
 
-    command -v mysqldump &>/dev/null || {
-        error "mysqldump não encontrado. Instale com: apt install mysql-client -y"
-        ((++errors))
-    }
-
-    command -v mysql &>/dev/null || {
-        error "mysql client não encontrado. Instale com: apt install mysql-client -y"
-        ((++errors))
-    }
-
-    command -v gzip &>/dev/null || {
-        error "gzip não encontrado."
-        ((++errors))
-    }
-
-    [[ -z "${AWS_ACCESS_KEY_ID}" ]] && {
-        error "AWS_ACCESS_KEY_ID não definido."
-        ((++errors))
-    }
-
-    [[ -z "${AWS_SECRET_ACCESS_KEY}" ]] && {
-        error "AWS_SECRET_ACCESS_KEY não definido."
-        ((++errors))
-    }
-
-    [[ -z "${RESTIC_PASSWORD}" ]] && {
-        error "RESTIC_PASSWORD não definido."
-        ((++errors))
-    }
-
-    [[ -z "${S3_BUCKET}" ]] && {
-        error "S3_BUCKET não definido."
-        ((++errors))
-    }
+    if [[ -z "${AWS_ACCESS_KEY_ID}" ]]; then
+        error "AWS_ACCESS_KEY_ID não definido."; errors=$((errors + 1))
+    fi
+    if [[ -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
+        error "AWS_SECRET_ACCESS_KEY não definido."; errors=$((errors + 1))
+    fi
+    if [[ -z "${RESTIC_PASSWORD}" ]]; then
+        error "RESTIC_PASSWORD não definido."; errors=$((errors + 1))
+    fi
+    if [[ -z "${S3_BUCKET}" ]]; then
+        error "S3_BUCKET não definido."; errors=$((errors + 1))
+    fi
+    if [[ ! -d "${BACKUP_SOURCE}" ]]; then
+        error "Diretório de origem não existe: ${BACKUP_SOURCE}"; errors=$((errors + 1))
+    fi
 
     (( errors == 0 )) || die "${errors} erro(s) de configuração encontrados. Abortando."
+}
+
+# Garante que só um backup rode por vez (evita corromper dumps entre execuções).
+acquire_lock() {
+    if ! command -v flock &>/dev/null; then
+        warn "flock não encontrado (util-linux). Prosseguindo SEM proteção contra execução simultânea."
+        return 0
+    fi
+    # Usa file descriptor 9 preso ao LOCK_FILE; flock não-bloqueante.
+    exec 9>"${LOCK_FILE}" || die "Não foi possível abrir o lock ${LOCK_FILE}."
+    if ! flock -n 9; then
+        die "Outra execução do backup já está em andamento (lock: ${LOCK_FILE}). Abortando."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -186,11 +309,33 @@ export_restic_env() {
 }
 
 # ---------------------------------------------------------------------------
+# CREDENCIAIS MYSQL — arquivo temporário (não vaza no `ps aux`)
+# ---------------------------------------------------------------------------
+
+build_mysql_defaults_file() {
+    MYSQL_DEFAULTS_FILE="$(mktemp)"
+    chmod 600 "${MYSQL_DEFAULTS_FILE}"
+    {
+        echo "[client]"
+        echo "user=${MYSQL_USER}"
+        echo "host=${MYSQL_HOST}"
+        # Só escreve a senha se houver uma (permite auth por socket sem senha).
+        if [[ -n "${MYSQL_PASSWORD}" ]]; then
+            echo "password=${MYSQL_PASSWORD}"
+        fi
+    } > "${MYSQL_DEFAULTS_FILE}"
+}
+
+# Wrappers: sempre usam o defaults-file como PRIMEIRO argumento.
+mysql_cmd()     { mysql     --defaults-extra-file="${MYSQL_DEFAULTS_FILE}" "$@"; }
+mysqldump_cmd() { mysqldump --defaults-extra-file="${MYSQL_DEFAULTS_FILE}" "$@"; }
+
+# ---------------------------------------------------------------------------
 # INICIALIZA REPOSITÓRIO (se necessário)
 # ---------------------------------------------------------------------------
 
 init_repo_if_needed() {
-    if restic snapshots &>/dev/null; then
+    if restic cat config &>/dev/null; then
         info "Repositório restic já existe em: ${RESTIC_REPOSITORY}"
         return 0
     fi
@@ -210,6 +355,17 @@ init_repo_if_needed() {
 # DUMP DOS BANCOS MYSQL
 # ---------------------------------------------------------------------------
 
+check_disk_space() {
+    # Verifica espaço livre no filesystem de DB_DUMP_DIR antes de dumpar.
+    mkdir -p "${DB_DUMP_DIR}"
+    local free_mb
+    free_mb="$(df -Pm "${DB_DUMP_DIR}" | awk 'NR==2 {print $4}')"
+    if [[ -n "${free_mb}" ]] && (( free_mb < MIN_FREE_MB )); then
+        die "Espaço insuficiente em ${DB_DUMP_DIR}: ${free_mb}MB livres (< ${MIN_FREE_MB}MB exigidos)."
+    fi
+    info "Espaço livre em ${DB_DUMP_DIR}: ${free_mb}MB (mínimo ${MIN_FREE_MB}MB) OK."
+}
+
 dump_databases() {
     info "Iniciando dump dos bancos MySQL em ${DB_DUMP_DIR}"
 
@@ -218,93 +374,73 @@ dump_databases() {
         return 0
     fi
 
-    local mysql_pass_arg=""
-    if [[ -n "${MYSQL_PASSWORD}" ]]; then
-        mysql_pass_arg="--password=${MYSQL_PASSWORD}"
-    fi
-
-    # Valida conexão com MySQL ANTES de apagar dumps antigos
+    # Valida conexão com MySQL ANTES de apagar dumps antigos.
     info "Testando conexão com MySQL..."
-    if ! mysql \
-        --user="${MYSQL_USER}" \
-        ${mysql_pass_arg} \
-        --host="${MYSQL_HOST}" \
-        --silent \
-        -e "SELECT 1;" &>/dev/null; then
+    if ! mysql_cmd --silent -e "SELECT 1;" &>/dev/null; then
         die "Falha ao conectar no MySQL. Dumps antigos preservados."
     fi
     info "Conexão com MySQL OK."
 
-    # Só limpa os dumps antigos após confirmar que o MySQL está acessível
-    mkdir -p "${DB_DUMP_DIR}"
+    check_disk_space
+
     chmod 700 "${DB_DUMP_DIR}"
     info "Limpando dumps antigos em ${DB_DUMP_DIR}"
     find "${DB_DUMP_DIR}" -type f -name "*.sql.gz" -delete
 
     local db_list
-    db_list=$(mysql \
-        --user="${MYSQL_USER}" \
-        ${mysql_pass_arg} \
-        --host="${MYSQL_HOST}" \
-        --skip-column-names \
-        --silent \
-        -e "SHOW DATABASES;" \
-        2>>"${LOG_FILE}" \
-        | grep -Ev "^(information_schema|performance_schema|sys|mysql)$"
-    ) || die "Falha ao listar bancos de dados."
+    db_list="$(mysql_cmd --skip-column-names --silent -e "SHOW DATABASES;" 2>>"${LOG_FILE}" \
+        | grep -Ev "^(information_schema|performance_schema|sys|mysql)$" || true)"
 
     if [[ -z "${db_list}" ]]; then
         warn "Nenhum banco de usuário encontrado."
         return 0
     fi
 
-    local ok=0
-    local fail=0
-
+    local ok=0 fail=0
     while IFS= read -r db; do
         [[ -z "${db}" ]] && continue
-
         local dump_file="${DB_DUMP_DIR}/${db}.sql.gz"
 
         info "Dumping banco: ${db}"
 
-        if mysqldump \
-            --user="${MYSQL_USER}" \
-            ${mysql_pass_arg} \
-            --host="${MYSQL_HOST}" \
+        # PIPESTATUS captura a falha do mysqldump mesmo com pipe pro gzip.
+        set +e
+        mysqldump_cmd \
             --single-transaction \
             --quick \
             --routines \
             --triggers \
             --events \
-            "${db}" \
-            2>>"${LOG_FILE}" \
-            | gzip -9 > "${dump_file}"; then
+            "${db}" 2>>"${LOG_FILE}" | gzip -9 > "${dump_file}"
+        local dump_rc=${PIPESTATUS[0]}
+        set -e
 
+        if (( dump_rc == 0 )); then
             chmod 600 "${dump_file}"
-            ((++ok))
+            ok=$((ok + 1))
         else
-            error "Falha no dump do banco: ${db}"
+            error "Falha no dump do banco: ${db} (rc=${dump_rc})"
             rm -f "${dump_file}"
-            ((++fail))
+            fail=$((fail + 1))
         fi
     done <<< "${db_list}"
 
     info "Dump finalizado: ${ok} banco(s) OK, ${fail} falha(s)."
 
     if (( fail > 0 )); then
-        warn "Alguns bancos falharam no dump. Backup do /home continuará, mas revise o log."
+        warn "Alguns bancos falharam no dump. Backup do ${BACKUP_SOURCE} continuará, mas revise o log."
     fi
 }
 
 # ---------------------------------------------------------------------------
-# ARQUIVO DE EXCLUSÕES (criado após source do env)
+# ARQUIVO DE EXCLUSÕES
 # ---------------------------------------------------------------------------
+# NOTA: mantidos os excludes originais. Ciente de que *.log e .git são
+# excluídos do restic — se precisar do histórico git ou de logs para auditoria
+# ao restaurar uma app, remova as linhas correspondentes.
 
 build_exclude_file() {
-    EXCLUDE_FILE="$(mktemp /tmp/restic-excludes.XXXXXX)"
-    trap 'rm -f "${EXCLUDE_FILE}"' EXIT
-
+    EXCLUDE_FILE="$(mktemp)"
     cat > "${EXCLUDE_FILE}" << 'EXCLUDES'
 # Dependências e caches de projeto
 node_modules
@@ -359,12 +495,12 @@ EXCLUDES
 # ---------------------------------------------------------------------------
 
 run_backup() {
-    info "Iniciando backup restic de /home"
+    info "Iniciando backup restic de ${BACKUP_SOURCE}"
     info "Repositório: ${RESTIC_REPOSITORY}"
 
     local restic_flags=(
         backup
-        /home
+        "${BACKUP_SOURCE}"
         --exclude-file="${EXCLUDE_FILE}"
         --tag "host=$(hostname -s)"
         --tag "runcloud"
@@ -383,7 +519,7 @@ run_backup() {
 }
 
 # ---------------------------------------------------------------------------
-# BACKUP SEMANAL — .tar.gz por aplicação (sextas ou FORCE_ARCHIVE=true)
+# BACKUP SEMANAL — .tar.gz por aplicação (dia configurável ou FORCE_ARCHIVE)
 # ---------------------------------------------------------------------------
 
 run_weekly_app_archives() {
@@ -396,7 +532,7 @@ run_weekly_app_archives() {
     today_dow="$(date +%w)"
 
     if [[ "${today_dow}" != "${ARCHIVE_DAY}" ]] && [[ "${FORCE_ARCHIVE:-false}" != "true" ]]; then
-        info "Backup compactado semanal pulado. Configurado para rodar no dia ${ARCHIVE_DAY} (hoje: ${today_dow})."
+        info "Backup compactado semanal pulado. Configurado para o dia ${ARCHIVE_DAY} (hoje: ${today_dow})."
         return 0
     fi
 
@@ -405,47 +541,51 @@ run_weekly_app_archives() {
         return 0
     fi
 
-    command -v aws &>/dev/null || {
-        warn "aws cli não encontrado. Instale com: apt install awscli -y"
+    require_cmd aws "apt install awscli -y (ou use o instalador oficial da AWS)." || {
+        warn "aws cli não encontrado. Pulando compactados semanais."
         return 0
     }
 
-    local today
+    local today base_s3_path
     today="$(date '+%Y-%m-%d')"
-    local base_s3_path="s3://${S3_BUCKET}/${ARCHIVE_S3_PREFIX}/${S3_PREFIX}/${today}"
+    base_s3_path="s3://${S3_BUCKET}/${ARCHIVE_S3_PREFIX}/${S3_PREFIX}/${today}"
 
     info "Iniciando backup compactado semanal por aplicação."
     info "Destino S3: ${base_s3_path}"
 
-    # Dumps dos bancos
+    # Dumps dos bancos.
     if [[ -d "${DB_DUMP_DIR}" ]]; then
         info "Gerando arquivo compactado dos dumps dos bancos."
-        tar -czf - -C "$(dirname "${DB_DUMP_DIR}")" "$(basename "${DB_DUMP_DIR}")" \
-            2>>"${LOG_FILE}" \
+        set +e
+        tar -czf - -C "$(dirname "${DB_DUMP_DIR}")" "$(basename "${DB_DUMP_DIR}")" 2>>"${LOG_FILE}" \
             | aws s3 cp - "${base_s3_path}/databases-all.tar.gz" \
-                --region "${AWS_DEFAULT_REGION}" \
-                >>"${LOG_FILE}" 2>&1 \
-            || warn "Falha ao enviar databases-all.tar.gz para o S3."
+                --region "${AWS_DEFAULT_REGION}" >>"${LOG_FILE}" 2>&1
+        # Captura o array inteiro de uma vez: qualquer atribuição intermediária
+        # (ex.: `local x=${PIPESTATUS[0]}`) reseta PIPESTATUS.
+        local rc=("${PIPESTATUS[@]}")
+        set -e
+        if (( rc[0] != 0 || rc[1] != 0 )); then
+            warn "Falha ao gerar/enviar databases-all.tar.gz (tar=${rc[0]}, aws=${rc[1]})."
+        fi
     else
         warn "Diretório de dumps não encontrado: ${DB_DUMP_DIR}"
     fi
 
     # Aplicações RunCloud: /home/usuario/webapps/app
-    local app_count=0
-    local fail_count=0
-
+    local app_count=0 fail_count=0
     while IFS= read -r app_path; do
         [[ -z "${app_path}" ]] && continue
         [[ ! -d "${app_path}" ]] && continue
 
         local app_name owner_name s3_file
         app_name="$(basename "${app_path}")"
-        owner_name="$(echo "${app_path}" | awk -F/ '{print $3}')"
+        owner_name="$(basename "$(dirname "$(dirname "${app_path}")")")"  # /home/<owner>/webapps/<app>
         s3_file="${base_s3_path}/${owner_name}-${app_name}.tar.gz"
 
         info "Compactando: ${app_path} → ${s3_file}"
 
-        if tar -czf - \
+        set +e
+        tar -czf - \
             --exclude="wp-content/cache" \
             --exclude="wp-content/upgrade" \
             --exclude="wp-content/ai1wm-backups" \
@@ -454,24 +594,31 @@ run_weekly_app_archives() {
             --exclude="wp-content/wpvividbackups" \
             --exclude="node_modules" \
             --exclude=".git" \
-            -C "$(dirname "${app_path}")" "$(basename "${app_path}")" \
-            2>>"${LOG_FILE}" \
+            -C "$(dirname "${app_path}")" "${app_name}" 2>>"${LOG_FILE}" \
             | aws s3 cp - "${s3_file}" \
-                --region "${AWS_DEFAULT_REGION}" \
-                >>"${LOG_FILE}" 2>&1; then
-            ((++app_count))
-        else
-            warn "Falha ao compactar/enviar: ${app_path}"
-            ((++fail_count))
-        fi
+                --region "${AWS_DEFAULT_REGION}" >>"${LOG_FILE}" 2>&1
+        local rc=("${PIPESTATUS[@]}")
+        set -e
 
-    done < <(find /home -mindepth 3 -maxdepth 3 -type d -path "/home/*/webapps/*" | sort)
+        if (( rc[0] == 0 && rc[1] == 0 )); then
+            app_count=$((app_count + 1))
+        else
+            warn "Falha ao compactar/enviar: ${app_path} (tar=${rc[0]}, aws=${rc[1]})"
+            fail_count=$((fail_count + 1))
+        fi
+    done < <(find "${BACKUP_SOURCE}" -mindepth 3 -maxdepth 3 -type d -path "${BACKUP_SOURCE}/*/webapps/*" | sort)
 
     info "Backup compactado semanal finalizado: ${app_count} aplicação(ões) OK, ${fail_count} falha(s)."
+
+    # NOTA: a retenção/expiração dos .tar.gz é feita por uma S3 Lifecycle Rule
+    # no próprio bucket (prefixo Snapshots/, expira após N dias) — configurada
+    # uma única vez pelo instalar_backup.sh. Por isso o script NÃO apaga os
+    # baixáveis aqui. A variável ARCHIVE_KEEP_WEEKS fica só como referência da
+    # janela desejada (o valor efetivo é o "Days" da regra de lifecycle).
 }
 
 # ---------------------------------------------------------------------------
-# RETENÇÃO
+# RETENÇÃO (restic)
 # ---------------------------------------------------------------------------
 
 run_forget() {
@@ -479,8 +626,8 @@ run_forget() {
 
     local forget_flags=(
         forget
-        --keep-daily  "${KEEP_DAILY}"
-        --keep-weekly "${KEEP_WEEKLY}"
+        --keep-daily   "${KEEP_DAILY}"
+        --keep-weekly  "${KEEP_WEEKLY}"
         --keep-monthly "${KEEP_MONTHLY}"
         --prune
         --group-by "host,paths"
@@ -513,12 +660,68 @@ run_check() {
         fi
 
         restic check --read-data-subset="${CHECK_DATA_SUBSET}" \
-            || warn "restic check encontrou problemas. Rode check completo manualmente se necessário."
+            || warn "restic check encontrou problemas. Rode 'restic check --read-data' completo se necessário."
 
         info "Check finalizado."
     else
         info "Check pulado. Configurado para o dia da semana: ${CHECK_DAY} (hoje: ${today_dow})"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# TESTE DE RESTORE (--test-restore)
+# ---------------------------------------------------------------------------
+# Restaura o snapshot mais recente para um diretório temporário, validando
+# de ponta a ponta que os backups são de fato recuperáveis. Não altera nada
+# no repositório nem em /home.
+
+run_test_restore() {
+    info "════════════════════════════════════════════"
+    info "TESTE DE RESTORE — validando recuperabilidade"
+    info "════════════════════════════════════════════"
+
+    local latest
+    latest="$(restic snapshots --json 2>>"${LOG_FILE}" \
+        | grep -o '"short_id":"[^"]*"' | tail -1 | cut -d'"' -f4 || true)"
+
+    if [[ -z "${latest}" ]]; then
+        die "Nenhum snapshot encontrado para testar restore."
+    fi
+    info "Snapshot mais recente: ${latest}"
+
+    RESTORE_TEST_DIR="$(mktemp -d)"
+    info "Restaurando amostra para: ${RESTORE_TEST_DIR}"
+
+    # Restaura apenas um subconjunto para ser rápido: o diretório de dumps.
+    # (--include limita o que é materializado; ajuste conforme necessário.)
+    if ! restic restore "${latest}" \
+            --target "${RESTORE_TEST_DIR}" \
+            --include "${DB_DUMP_DIR}" 2>>"${LOG_FILE}"; then
+        die "Falha ao restaurar amostra do snapshot ${latest}."
+    fi
+
+    # Valida que ao menos um dump foi restaurado e é um gzip íntegro.
+    local restored_dump
+    restored_dump="$(find "${RESTORE_TEST_DIR}" -type f -name "*.sql.gz" | head -1 || true)"
+
+    if [[ -z "${restored_dump}" ]]; then
+        warn "Nenhum dump .sql.gz na amostra restaurada (talvez não haja bancos). Validando arquivos genéricos."
+        local any_file
+        any_file="$(find "${RESTORE_TEST_DIR}" -type f | head -1 || true)"
+        [[ -z "${any_file}" ]] && die "Restore não materializou nenhum arquivo. FALHA no teste."
+        info "Arquivo restaurado com sucesso: ${any_file}"
+    else
+        info "Validando integridade do dump restaurado: ${restored_dump}"
+        if gzip -t "${restored_dump}" 2>>"${LOG_FILE}"; then
+            info "Dump restaurado e íntegro (gzip -t OK): ${restored_dump}"
+        else
+            die "Dump restaurado está CORROMPIDO: ${restored_dump}. FALHA no teste."
+        fi
+    fi
+
+    info "════════════════════════════════════════════"
+    info "TESTE DE RESTORE CONCLUÍDO COM SUCESSO ✅"
+    info "════════════════════════════════════════════"
 }
 
 # ---------------------------------------------------------------------------
@@ -535,7 +738,12 @@ print_summary() {
 # ---------------------------------------------------------------------------
 
 main() {
+    # Carrega o env PRIMEIRO: ele pode redefinir LOG_FILE e LOCK_FILE, que são
+    # usados logo abaixo por rotate_log e acquire_lock.
+    load_env_file
+
     rotate_log
+    acquire_lock
 
     info "════════════════════════════════════════════"
     info "Backup iniciado | host: $(hostname -s) | data: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -545,6 +753,17 @@ main() {
 
     validate_env
     export_restic_env
+    build_mysql_defaults_file
+
+    notify_start
+
+    # Modo teste de restore: valida e sai, sem rodar o backup.
+    if [[ "${TEST_RESTORE}" == "true" ]]; then
+        run_test_restore
+        notify_success
+        exit 0
+    fi
+
     build_exclude_file
     init_repo_if_needed
     dump_databases
@@ -557,6 +776,8 @@ main() {
     info "════════════════════════════════════════════"
     info "Backup finalizado | host: $(hostname -s) | data: $(date '+%Y-%m-%d %H:%M:%S')"
     info "════════════════════════════════════════════"
+
+    notify_success
 }
 
 main
