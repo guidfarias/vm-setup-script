@@ -59,7 +59,8 @@ KEEP_DAILY="${KEEP_DAILY:-5}"
 KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
 KEEP_MONTHLY="${KEEP_MONTHLY:-4}"
 
-CHECK_DAY="${CHECK_DAY:-0}"
+# Segunda-feira (o cron roda seg-sex; 0=domingo nunca executaria).
+CHECK_DAY="${CHECK_DAY:-1}"
 # Aceita valor fixo (ex.: 5G) ou percentual (ex.: 10%). Percentual escala com o repo.
 CHECK_DATA_SUBSET="${CHECK_DATA_SUBSET:-10%}"
 

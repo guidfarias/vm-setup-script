@@ -156,7 +156,7 @@ ARCHIVE_DAY='5'
 ARCHIVE_S3_PREFIX='Snapshots'
 ARCHIVE_KEEP_WEEKS='4'
 
-CHECK_DAY='0'
+CHECK_DAY='1'
 CHECK_DATA_SUBSET='10%'
 
 MIN_FREE_MB='2048'
@@ -182,7 +182,7 @@ LOG_FILE='/var/log/restic-backup.log'
 | `ARCHIVE_DAY` | Dia da semana para gerar os `.tar.gz` (`5` = sexta) |
 | `ARCHIVE_S3_PREFIX` | Prefixo dos baixáveis no S3 (`Snapshots`) |
 | `ARCHIVE_KEEP_WEEKS` | **Apenas referência** — a expiração real é feita pelo lifecycle S3 |
-| `CHECK_DAY` | Dia da semana do check de integridade (`0` = domingo) |
+| `CHECK_DAY` | Dia da semana do check de integridade (`1` = segunda). Use um dia útil — o cron roda apenas seg-sex |
 | `CHECK_DATA_SUBSET` | Quanto ler no check. Aceita tamanho (`5G`) ou percentual (`10%`). **Percentual escala com o repositório** |
 | `MIN_FREE_MB` | Espaço livre mínimo (MB) exigido em `DB_DUMP_DIR` antes de dumpar (padrão `2048`) |
 | `LOG_FILE` | Arquivo de log (rotacionado automaticamente) |
