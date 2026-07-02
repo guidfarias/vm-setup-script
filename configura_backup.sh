@@ -38,9 +38,9 @@ RESTIC_ENV_FILE="${RESTIC_ENV_FILE:-/etc/restic/env}"
 
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
-AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-sa-east-1}"
+AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-S3_BUCKET="${S3_BUCKET:-cipnet-backups-runcloud}"
+S3_BUCKET="${S3_BUCKET:-runcloud-backup-cipcloud}"
 S3_PREFIX="${S3_PREFIX:-$(hostname -s)}"
 RESTIC_S3_PREFIX="${RESTIC_S3_PREFIX:-Restic/${S3_PREFIX}}"
 
@@ -56,8 +56,8 @@ MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
 MYSQL_HOST="${MYSQL_HOST:-localhost}"
 
 KEEP_DAILY="${KEEP_DAILY:-7}"
-KEEP_WEEKLY="${KEEP_WEEKLY:-2}"
-KEEP_MONTHLY="${KEEP_MONTHLY:-2}"
+KEEP_WEEKLY="${KEEP_WEEKLY:-3}"
+KEEP_MONTHLY="${KEEP_MONTHLY:-3}"
 
 CHECK_DAY="${CHECK_DAY:-0}"
 # Aceita valor fixo (ex.: 5G) ou percentual (ex.: 10%). Percentual escala com o repo.
@@ -79,7 +79,7 @@ TEST_RESTORE=false
 ENABLE_WEEKLY_ARCHIVES="${ENABLE_WEEKLY_ARCHIVES:-true}"
 ARCHIVE_DAY="${ARCHIVE_DAY:-5}"
 ARCHIVE_S3_PREFIX="${ARCHIVE_S3_PREFIX:-Snapshots}"
-ARCHIVE_KEEP_WEEKS="${ARCHIVE_KEEP_WEEKS:-4}"
+ARCHIVE_KEEP_WEEKS="${ARCHIVE_KEEP_WEEKS:-1}"
 
 # ---------------------------------------------------------------------------
 # ALERTAS (opcional) — Healthchecks.io (dead man's switch)
