@@ -55,9 +55,9 @@ MYSQL_USER="${MYSQL_USER:-root}"
 MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
 MYSQL_HOST="${MYSQL_HOST:-localhost}"
 
-KEEP_DAILY="${KEEP_DAILY:-7}"
-KEEP_WEEKLY="${KEEP_WEEKLY:-3}"
-KEEP_MONTHLY="${KEEP_MONTHLY:-3}"
+KEEP_DAILY="${KEEP_DAILY:-5}"
+KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
+KEEP_MONTHLY="${KEEP_MONTHLY:-4}"
 
 CHECK_DAY="${CHECK_DAY:-0}"
 # Aceita valor fixo (ex.: 5G) ou percentual (ex.: 10%). Percentual escala com o repo.
