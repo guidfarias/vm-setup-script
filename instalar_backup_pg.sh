@@ -186,15 +186,22 @@ ensure_pg_client() {
     fi
 
     # pg_dump precisa ser >= versão do cluster mais novo (dump de cluster mais
-    # novo com cliente antigo falha). No Debian/Ubuntu o wrapper /usr/bin/pg_dump
-    # usa a versão mais nova instalada — normalmente já resolve.
+    # novo com cliente antigo falha). NÃO usa `pg_dump --version` para checar:
+    # o wrapper /usr/bin/pg_dump escolhe a versão pelo cluster da porta 5432 e
+    # engana. Compara a versão mais nova INSTALADA em /usr/lib/postgresql — que
+    # é a que o script de backup usa automaticamente.
     if command -v pg_lsclusters &>/dev/null; then
         local newest cli
         newest="$(pg_lsclusters -h 2>/dev/null | awk '{print $1}' | sort -V | tail -1)"
-        cli="$(pg_dump --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
-        if [[ -n "${newest}" && -n "${cli}" ]] && (( cli < newest )); then
-            log_warn "pg_dump é versão ${cli}, mas existe cluster versão ${newest}."
-            log_warn "Instale o cliente mais novo: apt-get install -y postgresql-client-${newest}"
+        cli="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 \
+               | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+        [[ -n "${cli}" ]] || cli="$(pg_dump --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+        if [[ -n "${newest}" && -n "${cli}" ]] \
+            && [[ "$(printf '%s\n%s\n' "${cli}" "${newest}" | sort -V | tail -1)" != "${cli}" ]]; then
+            log_warn "Cliente PostgreSQL mais novo instalado é ${cli}, mas há cluster versão ${newest}."
+            log_warn "Instale: apt-get install -y postgresql-client-${newest}"
+        else
+            log_info "Cliente PostgreSQL ${cli} cobre todos os clusters (o backup usa a versão mais nova instalada)."
         fi
     fi
 }

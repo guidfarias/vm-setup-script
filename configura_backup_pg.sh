@@ -86,6 +86,12 @@ PG_HOST="${PG_HOST:-localhost}"
 # Descubra as portas com: pg_lsclusters
 PG_PORTS="${PG_PORTS:-5432}"
 PG_SYSTEM_USER="${PG_SYSTEM_USER:-postgres}"
+# Diretório dos binários (pg_dump/psql/...). Vazio (padrão) → usa a versão
+# MAIS NOVA em /usr/lib/postgresql/*/bin, com fallback para o PATH.
+# Necessário porque o wrapper /usr/bin/pg_dump do Debian/Ubuntu escolhe a
+# versão pelo cluster da porta 5432 — e um pg_dump antigo se RECUSA a dumpar
+# um cluster mais novo. A versão mais nova dumpa todos.
+PG_BIN_DIR="${PG_BIN_DIR:-}"
 # Bancos ignorados no dump (regex ERE). Templates já são filtrados na query.
 PG_EXCLUDE_REGEX="${PG_EXCLUDE_REGEX:-^(postgres)$}"
 
@@ -161,6 +167,12 @@ EXCLUDE_FILE=""
 PGPASS_FILE=""
 PG_USE_SUDO=false
 RESTORE_TEST_DIR=""
+
+# Caminhos efetivos dos binários PostgreSQL (definidos por resolve_pg_bins).
+PSQL_BIN="psql"
+PG_DUMP_BIN="pg_dump"
+PG_DUMPALL_BIN="pg_dumpall"
+PG_RESTORE_BIN="pg_restore"
 
 cleanup() {
     # Preserva o código de saída original: como este é o trap de EXIT, o status
@@ -336,15 +348,33 @@ require_cmd() {
     return 0
 }
 
+# Define QUAL versão dos binários PostgreSQL usar (ver comentário em PG_BIN_DIR).
+resolve_pg_bins() {
+    if [[ -z "${PG_BIN_DIR}" ]]; then
+        PG_BIN_DIR="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+    fi
+    if [[ -n "${PG_BIN_DIR}" && -x "${PG_BIN_DIR}/pg_dump" ]]; then
+        PSQL_BIN="${PG_BIN_DIR}/psql"
+        PG_DUMP_BIN="${PG_BIN_DIR}/pg_dump"
+        PG_DUMPALL_BIN="${PG_BIN_DIR}/pg_dumpall"
+        PG_RESTORE_BIN="${PG_BIN_DIR}/pg_restore"
+        info "Binários PostgreSQL: ${PG_BIN_DIR} ($("${PG_DUMP_BIN}" --version 2>/dev/null | head -1))"
+    else
+        [[ -n "${PG_BIN_DIR}" ]] && warn "PG_BIN_DIR='${PG_BIN_DIR}' sem pg_dump executável — usando binários do PATH."
+        PG_BIN_DIR=""
+        info "Binários PostgreSQL: do PATH ($(pg_dump --version 2>/dev/null | head -1 || echo 'pg_dump ausente'))"
+    fi
+}
+
 validate_env() {
     local errors=0
 
-    require_cmd restic     "Instale o restic (https://restic.net)."      || errors=$((errors + 1))
-    require_cmd pg_dump    "apt install postgresql-client -y"            || errors=$((errors + 1))
-    require_cmd pg_dumpall "apt install postgresql-client -y"            || errors=$((errors + 1))
-    require_cmd pg_restore "apt install postgresql-client -y"            || errors=$((errors + 1))
-    require_cmd psql       "apt install postgresql-client -y"            || errors=$((errors + 1))
-    require_cmd gzip       "apt install gzip -y"                         || errors=$((errors + 1))
+    require_cmd restic             "Instale o restic (https://restic.net)."  || errors=$((errors + 1))
+    require_cmd "${PG_DUMP_BIN}"    "apt install postgresql-client -y"       || errors=$((errors + 1))
+    require_cmd "${PG_DUMPALL_BIN}" "apt install postgresql-client -y"       || errors=$((errors + 1))
+    require_cmd "${PG_RESTORE_BIN}" "apt install postgresql-client -y"       || errors=$((errors + 1))
+    require_cmd "${PSQL_BIN}"       "apt install postgresql-client -y"       || errors=$((errors + 1))
+    require_cmd gzip               "apt install gzip -y"                     || errors=$((errors + 1))
 
     if [[ -z "${AWS_ACCESS_KEY_ID}" ]]; then
         error "AWS_ACCESS_KEY_ID não definido."; errors=$((errors + 1))
@@ -441,9 +471,10 @@ pg_exec() {
 
 # Wrappers: 1º argumento é a PORTA do cluster; -X ignora .psqlrc. A porta vai
 # explícita em cada comando (o sudo não repassa variáveis PG* exportadas).
-psql_cmd()       { local p="$1"; shift; pg_exec psql       -X -p "${p}" "$@"; }
-pg_dump_cmd()    { local p="$1"; shift; pg_exec pg_dump       -p "${p}" "$@"; }
-pg_dumpall_cmd() { local p="$1"; shift; pg_exec pg_dumpall    -p "${p}" "$@"; }
+# Os *_BIN vêm de resolve_pg_bins (versão mais nova instalada).
+psql_cmd()       { local p="$1"; shift; pg_exec "${PSQL_BIN}"       -X -p "${p}" "$@"; }
+pg_dump_cmd()    { local p="$1"; shift; pg_exec "${PG_DUMP_BIN}"       -p "${p}" "$@"; }
+pg_dumpall_cmd() { local p="$1"; shift; pg_exec "${PG_DUMPALL_BIN}"    -p "${p}" "$@"; }
 
 # ---------------------------------------------------------------------------
 # INICIALIZA REPOSITÓRIO (se necessário)
@@ -886,7 +917,7 @@ run_test_restore() {
 
     if [[ -n "${restored_dump}" ]]; then
         info "Validando integridade do dump restaurado: ${restored_dump}"
-        if pg_restore --list "${restored_dump}" >/dev/null 2>>"${LOG_FILE}"; then
+        if "${PG_RESTORE_BIN}" --list "${restored_dump}" >/dev/null 2>>"${LOG_FILE}"; then
             info "Dump restaurado e íntegro (pg_restore --list OK): ${restored_dump}"
         else
             die "Dump restaurado está CORROMPIDO: ${restored_dump}. FALHA no teste."
@@ -1052,6 +1083,7 @@ main() {
 
     [[ "${DRY_RUN}" == "true" ]] && warn "Modo DRY-RUN ativo."
 
+    resolve_pg_bins
     validate_env
     export_restic_env
     setup_pg_auth
