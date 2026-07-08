@@ -186,7 +186,10 @@ cleanup() {
     elif (( ${#STATUS_ERRORS[@]} > 0 )); then
         overall="partial"
     fi
-    write_status "${overall}" || true
+    # (declare -F: em saídas precoces como --help, write_status ainda não existe)
+    if declare -F write_status &>/dev/null; then
+        write_status "${overall}" || true
+    fi
 
     [[ -n "${EXCLUDE_FILE}" ]]     && rm -f "${EXCLUDE_FILE}"
     [[ -n "${RESTORE_TEST_DIR}" ]] && rm -rf "${RESTORE_TEST_DIR}"
