@@ -4,11 +4,18 @@
 # CIPNET — variante para servidores Dokploy (painel PaaS via Docker Swarm)
 #
 # O que é protegido:
-#   - O Postgres INTERNO do Dokploy (container "dokploy-postgres"): projetos,
-#     usuários, permissões, domínios, env vars, providers Git — dump lógico
-#     via `docker exec`, sem instalar cliente Postgres no host.
-#   - /etc/dokploy: configs do Traefik e certificados Let's Encrypt.
-#   Os apps dos clientes são stateless (reconstruíveis via Git) e ficam fora.
+#   - O Postgres INTERNO do Dokploy E qualquer Postgres de CLIENTE criado
+#     pelo painel — descoberta automática por imagem de container. Dump
+#     lógico via `docker exec` em ${DB_DUMP_DIR}/container-<serviço>/,
+#     sem instalar cliente Postgres no host e sem senha.
+#   - /etc/dokploy: configs do Traefik, certificados Let's Encrypt (e os
+#     clones de build dos apps, de brinde).
+#   - Volumes Docker (/var/lib/docker/volumes): uploads/persistência dos
+#     apps. Os volumes de DADOS dos bancos ficam fora do snapshot — já são
+#     cobertos pelos dumps lógicos (cópia crua de banco rodando corrompe).
+#   O código dos apps é reconstruível via Git e não depende deste backup.
+#   Containers de banco NÃO-Postgres (mysql/mongo) geram aviso no log e
+#   status "partial" até serem cobertos.
 #
 # O que este script faz:
 #   1. Carrega variáveis de /etc/restic/env (valida permissões 600/root)
@@ -32,10 +39,13 @@
 #   rr snapshots
 #   rr restore latest --target /tmp/rest --include /var/backups/db
 #   docker exec -i $(docker ps -q -f name=dokploy-postgres) \
-#       pg_restore -U dokploy --clean --if-exists -d dokploy < dokploy.dump
-#   gunzip -c globals.sql.gz | docker exec -i $(docker ps -q -f name=dokploy-postgres) \
-#       psql -U dokploy -d dokploy
+#       pg_restore -U dokploy --clean --if-exists -d dokploy \
+#       < container-dokploy-postgres/dokploy.dump
+#   (bancos de cliente: mesmo formato, em container-<serviço>/<banco>.dump,
+#    com o usuário do container — veja POSTGRES_USER nas envs dele)
+#   gunzip -c container-<serviço>/globals.sql.gz | docker exec -i <container> psql -U <user>
 #   /etc/dokploy → restaurar os arquivos e reiniciar o serviço dokploy.
+#   Volumes → restaurar o conteúdo em /var/lib/docker/volumes/<vol>/_data.
 #
 # ⚠️  IMPORTANTE — RECUPERAÇÃO DE DESASTRE:
 #   A RESTIC_PASSWORD é a ÚNICA forma de ler os backups restic. Se o servidor
@@ -74,13 +84,21 @@ BACKUP_SOURCE="${BACKUP_SOURCE:-/etc/dokploy}"
 # Fica FORA de BACKUP_SOURCE; o restic faz snapshot dele junto (ver run_backup).
 DB_DUMP_DIR="${DB_DUMP_DIR:-/var/backups/db}"
 
-# --- Postgres interno do Dokploy (container Swarm) ---
-# O container é localizado por filtro de nome (docker ps --filter name=...).
-# O dump roda DENTRO do container via docker exec — o socket local do
-# container é confiável (imagem oficial postgres), então não há senha.
+# --- Bancos (painel + clientes) ---
+# O container do PAINEL é localizado por filtro de nome e é obrigatório
+# (sem ele o backup aborta preservando os dumps antigos).
 DOKPLOY_PG_FILTER="${DOKPLOY_PG_FILTER:-dokploy-postgres}"
-DOKPLOY_PG_USER="${DOKPLOY_PG_USER:-dokploy}"
-DOKPLOY_PG_DB="${DOKPLOY_PG_DB:-dokploy}"
+# Descoberta automática: TODO container cuja imagem case com o regex abaixo
+# é dumpado (usuário/banco lidos das envs do próprio container). Amplie se
+# usar imagens derivadas: ex. 'postgres|pgvector|timescale'.
+DB_CONTAINER_IMAGE_REGEX="${DB_CONTAINER_IMAGE_REGEX:-postgres}"
+# Bancos ignorados no dump (regex ERE). Padrão: nenhum — o db 'postgres'
+# de manutenção é minúsculo e às vezes clientes o usam sem querer.
+PG_EXCLUDE_REGEX="${PG_EXCLUDE_REGEX:-^$}"
+# Volumes Docker no snapshot restic (uploads/persistência dos apps). Os
+# volumes de DADOS dos bancos Postgres são excluídos automaticamente.
+BACKUP_DOCKER_VOLUMES="${BACKUP_DOCKER_VOLUMES:-true}"
+DOCKER_VOLUMES_DIR="${DOCKER_VOLUMES_DIR:-/var/lib/docker/volumes}"
 
 KEEP_DAILY="${KEEP_DAILY:-5}"
 KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
@@ -122,7 +140,7 @@ HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 # inteira do mesmo jeito. Arquivo local de status (fallback / auditoria):
 STATUS_LOCAL_FILE="${STATUS_LOCAL_FILE:-/var/log/restic-status.json}"
 STATUS_S3_PREFIX="${STATUS_S3_PREFIX:-Monitoramento}"
-STATUS_SCRIPT_VERSION="2026-07-dokploy"
+STATUS_SCRIPT_VERSION="2026-07-dokploy-2"
 
 STATUS_STARTED_AT=""          # ISO8601 do início
 STATUS_DB_OK=0
@@ -373,26 +391,31 @@ export_restic_env() {
 }
 
 # ---------------------------------------------------------------------------
-# CONTAINER DO POSTGRES DO DOKPLOY
+# CONTAINERS DE BANCO (painel + clientes)
 # ---------------------------------------------------------------------------
 
-# Localiza o container do Postgres do Dokploy (Swarm gera nomes tipo
+# Executa um comando dentro de um container ($1 = nome). A variante _i passa
+# o stdin (pg_restore no teste de restore).
+pg_exec()   { local c="$1"; shift; docker exec    "${c}" "$@"; }
+pg_exec_i() { local c="$1"; shift; docker exec -i "${c}" "$@"; }
+
+# Localiza o container do Postgres do PAINEL (Swarm gera nomes tipo
 # "dokploy-postgres.1.abc123"). Preenche PG_CONTAINER; retorna 1 se não achar.
 find_pg_container() {
     PG_CONTAINER="$(docker ps --filter "name=${DOKPLOY_PG_FILTER}" \
         --format '{{.Names}}' 2>>"${LOG_FILE}" | head -1 || true)"
     if [[ -z "${PG_CONTAINER}" ]]; then
-        error "Container do Postgres não encontrado (filtro: name=${DOKPLOY_PG_FILTER})."
+        error "Container do Postgres do painel não encontrado (filtro: name=${DOKPLOY_PG_FILTER})."
         return 1
     fi
-    info "Container do Postgres: ${PG_CONTAINER}"
     return 0
 }
 
-# Executa um comando dentro do container do Postgres. Passa -i apenas quando
-# precisamos mandar dados pelo stdin (pg_restore no teste de restore).
-pg_exec()   { docker exec    "${PG_CONTAINER}" "$@"; }
-pg_exec_i() { docker exec -i "${PG_CONTAINER}" "$@"; }
+# Lista containers Postgres em execução: linhas "nome<TAB>imagem".
+list_db_containers() {
+    docker ps --format '{{.Names}}\t{{.Image}}' 2>>"${LOG_FILE}" \
+        | awk -F'\t' -v re="${DB_CONTAINER_IMAGE_REGEX}" '$2 ~ re {print $1 "\t" $2}' || true
+}
 
 # ---------------------------------------------------------------------------
 # INICIALIZA REPOSITÓRIO (se necessário)
@@ -429,66 +452,141 @@ check_disk_space() {
     info "Espaço livre em ${DB_DUMP_DIR}: ${free_mb}MB (mínimo ${MIN_FREE_MB}MB) OK."
 }
 
-dump_databases() {
-    info "Iniciando dump do banco do Dokploy em ${DB_DUMP_DIR}"
+# Dumpa UM container Postgres para ${DB_DUMP_DIR}/container-<serviço>/.
+# Usuário/banco de conexão vêm das envs do próprio container (POSTGRES_USER/
+# POSTGRES_DB — o painel usa dokploy/dokploy). Retorna 1 se o container
+# estiver inacessível (dumps antigos dele preservados). Incrementa
+# STATUS_DB_OK / STATUS_DB_FAIL diretamente.
+dump_pg_container() {
+    local cname="$1"
+    local svc="${cname%%.*}"      # dokploy-postgres.1.abc → dokploy-postgres
+    local cdir="${DB_DUMP_DIR}/container-${svc}"
 
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        warn "[DRY-RUN] Pulando dump do banco."
-        return 0
+    local pguser pgdb
+    pguser="$(pg_exec "${cname}" printenv POSTGRES_USER 2>/dev/null || true)"
+    pguser="${pguser:-postgres}"
+    pgdb="$(pg_exec "${cname}" printenv POSTGRES_DB 2>/dev/null || true)"
+    pgdb="${pgdb:-${pguser}}"
+
+    info "── Container ${svc} (user=${pguser}) ──"
+    if ! pg_exec "${cname}" psql -X -U "${pguser}" -d "${pgdb}" -Atqc "SELECT 1;" &>/dev/null; then
+        error "Falha ao conectar no Postgres do container ${svc}. Dumps antigos dele preservados."
+        status_add_error "conexão falhou: container ${svc}"
+        return 1
     fi
+    info "Conexão OK (${svc})."
 
-    # Localiza o container e valida a conexão ANTES de apagar dumps antigos.
-    find_pg_container || die "Sem container do Postgres. Dumps antigos preservados."
-
-    info "Testando conexão com o Postgres do Dokploy..."
-    if ! pg_exec psql -X -U "${DOKPLOY_PG_USER}" -d "${DOKPLOY_PG_DB}" -Atqc "SELECT 1;" &>/dev/null; then
-        die "Falha ao conectar no Postgres do Dokploy (user=${DOKPLOY_PG_USER}, db=${DOKPLOY_PG_DB}). Dumps antigos preservados."
-    fi
-    info "Conexão OK."
-
-    check_disk_space
-
-    chmod 700 "${DB_DUMP_DIR}"
-    info "Limpando dumps antigos em ${DB_DUMP_DIR}"
-    find "${DB_DUMP_DIR}" -type f \( -name "*.dump" -o -name "*.sql.gz" \) -delete
+    mkdir -p "${cdir}"
+    chmod 700 "${cdir}"
+    info "Limpando dumps antigos em ${cdir}"
+    find "${cdir}" -type f \( -name "*.dump" -o -name "*.sql.gz" \) -delete
 
     # Globals: roles e permissões — necessários para restaurar em host novo.
-    info "Dumping globals (roles/permissões): globals.sql.gz"
+    info "Dumping globals (roles/permissões): container-${svc}/globals.sql.gz"
     set +e
-    pg_exec pg_dumpall -U "${DOKPLOY_PG_USER}" --globals-only 2>>"${LOG_FILE}" \
-        | gzip -9 > "${DB_DUMP_DIR}/globals.sql.gz"
+    pg_exec "${cname}" pg_dumpall -U "${pguser}" --globals-only 2>>"${LOG_FILE}" \
+        | gzip -9 > "${cdir}/globals.sql.gz"
     local globals_rc=${PIPESTATUS[0]}
     set -e
     if (( globals_rc == 0 )); then
-        chmod 600 "${DB_DUMP_DIR}/globals.sql.gz"
+        chmod 600 "${cdir}/globals.sql.gz"
     else
-        error "Falha no dump dos globals (rc=${globals_rc})"
-        status_add_error "dump falhou: globals (rc=${globals_rc})"
-        rm -f "${DB_DUMP_DIR}/globals.sql.gz"
+        error "Falha no dump dos globals de ${svc} (rc=${globals_rc})"
+        status_add_error "dump falhou: globals ${svc} (rc=${globals_rc})"
+        rm -f "${cdir}/globals.sql.gz"
     fi
 
-    # Banco do painel. Formato custom (-Fc): já sai comprimido e restaura com
-    # pg_restore (inclusive tabelas isoladas). O redirecionamento é do host —
-    # o arquivo fica com dono root em DB_DUMP_DIR (chmod 700).
-    local dump_file="${DB_DUMP_DIR}/${DOKPLOY_PG_DB}.dump"
-    info "Dumping banco: ${DOKPLOY_PG_DB}"
+    # Lista bancos do container (templates ficam de fora na própria query).
+    local db_list
+    db_list="$(pg_exec "${cname}" psql -X -U "${pguser}" -d "${pgdb}" -Atqc \
+        "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname;" \
+        2>>"${LOG_FILE}" | grep -Ev "${PG_EXCLUDE_REGEX}" || true)"
 
-    set +e
-    pg_exec pg_dump -U "${DOKPLOY_PG_USER}" --format=custom --compress=6 \
-        "${DOKPLOY_PG_DB}" 2>>"${LOG_FILE}" > "${dump_file}"
-    local dump_rc=$?
-    set -e
+    if [[ -z "${db_list}" ]]; then
+        warn "Nenhum banco de usuário no container ${svc}."
+        return 0
+    fi
 
-    if (( dump_rc == 0 )); then
-        chmod 600 "${dump_file}"
-        STATUS_DB_OK=1
-        info "Dump finalizado: 1 banco OK."
-    else
-        error "Falha no dump do banco ${DOKPLOY_PG_DB} (rc=${dump_rc})"
-        status_add_error "dump falhou: ${DOKPLOY_PG_DB} (rc=${dump_rc})"
-        rm -f "${dump_file}"
-        STATUS_DB_FAIL=1
-        warn "O dump falhou. Backup do ${BACKUP_SOURCE} continuará, mas revise o log."
+    while IFS= read -r db; do
+        [[ -z "${db}" ]] && continue
+        local dump_file="${cdir}/${db}.dump"
+
+        info "Dumping banco: ${db} (${svc})"
+
+        # Formato custom (-Fc): já sai comprimido e restaura com pg_restore.
+        # O redirecionamento é do host — o arquivo fica com dono root.
+        set +e
+        pg_exec "${cname}" pg_dump -U "${pguser}" --format=custom --compress=6 \
+            "${db}" 2>>"${LOG_FILE}" > "${dump_file}"
+        local dump_rc=$?
+        set -e
+
+        if (( dump_rc == 0 )); then
+            chmod 600 "${dump_file}"
+            STATUS_DB_OK=$((STATUS_DB_OK + 1))
+        else
+            error "Falha no dump do banco ${db} em ${svc} (rc=${dump_rc})"
+            status_add_error "dump falhou: ${db}@${svc} (rc=${dump_rc})"
+            rm -f "${dump_file}"
+            STATUS_DB_FAIL=$((STATUS_DB_FAIL + 1))
+        fi
+    done <<< "${db_list}"
+
+    return 0
+}
+
+dump_databases() {
+    info "Iniciando dump dos bancos (painel + clientes) em ${DB_DUMP_DIR}"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        warn "[DRY-RUN] Pulando dump de bancos."
+        return 0
+    fi
+
+    # O Postgres do PAINEL precisa existir — sem ele o servidor está doente
+    # e nada é apagado.
+    find_pg_container || die "Sem container do Postgres do painel. Dumps antigos preservados."
+    info "Container do painel: ${PG_CONTAINER}"
+
+    local containers
+    containers="$(list_db_containers)"
+    if [[ -z "${containers}" ]]; then
+        die "Nenhum container Postgres em execução (regex de imagem: ${DB_CONTAINER_IMAGE_REGEX}). Dumps antigos preservados."
+    fi
+
+    check_disk_space
+    chmod 700 "${DB_DUMP_DIR}"
+
+    local reachable=0 cname
+    while IFS=$'\t' read -r cname _; do
+        [[ -z "${cname}" ]] && continue
+        if dump_pg_container "${cname}"; then
+            reachable=$((reachable + 1))
+        fi
+    done <<< "${containers}"
+
+    if (( reachable == 0 )); then
+        die "Nenhum container Postgres acessível. Dumps antigos preservados."
+    fi
+
+    # Bancos que o script AINDA não cobre (dump lógico é só para Postgres).
+    # Gera status "partial" de propósito: o monitoramento cobra até cobrirmos.
+    local others
+    others="$(docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | awk -F'\t' '$2 ~ /mysql|mariadb|mongo/ {print $1}' | tr '\n' ' ' || true)"
+    if [[ -n "${others// /}" ]]; then
+        warn "Containers de banco NÃO-Postgres detectados (sem dump lógico ainda): ${others}"
+        status_add_error "bancos não cobertos: ${others}"
+    fi
+
+    # Remove resquícios de layout antigo: arquivos soltos na raiz de
+    # DB_DUMP_DIR (os dumps atuais vivem em container-<serviço>/).
+    find "${DB_DUMP_DIR}" -maxdepth 1 -type f \( -name "*.dump" -o -name "*.sql.gz" \) -delete
+
+    info "Dump finalizado: ${STATUS_DB_OK} banco(s) OK, ${STATUS_DB_FAIL} falha(s)."
+
+    if (( STATUS_DB_FAIL > 0 )); then
+        warn "Alguns bancos falharam no dump. Backup continuará, mas revise o log."
     fi
 }
 
@@ -513,18 +611,40 @@ EXCLUDES
     printf '%s\n' "${BACKUP_SOURCE}/logs" >> "${EXCLUDE_FILE}"
 }
 
+# Exclui do snapshot os volumes de DADOS dos containers Postgres: eles já
+# estão protegidos pelos dumps lógicos, e cópia crua de banco rodando sai
+# inconsistente. Os demais volumes (uploads/persistência dos apps) ficam.
+exclude_db_volumes() {
+    [[ "${BACKUP_DOCKER_VOLUMES}" != "true" ]] && return 0
+    local cname vol
+    while IFS=$'\t' read -r cname _; do
+        [[ -z "${cname}" ]] && continue
+        while IFS= read -r vol; do
+            [[ -z "${vol}" ]] && continue
+            printf '%s\n' "${DOCKER_VOLUMES_DIR}/${vol}" >> "${EXCLUDE_FILE}"
+            info "Volume de banco fora do snapshot (coberto pelo dump): ${vol}"
+        done < <(docker inspect -f \
+            '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' \
+            "${cname}" 2>/dev/null || true)
+    done <<< "$(list_db_containers)"
+}
+
 # ---------------------------------------------------------------------------
 # BACKUP DO /ETC/DOKPLOY + DUMPS
 # ---------------------------------------------------------------------------
 
 run_backup() {
-    info "Iniciando backup restic de ${BACKUP_SOURCE} + ${DB_DUMP_DIR}"
+    local backup_paths=("${BACKUP_SOURCE}" "${DB_DUMP_DIR}")
+    if [[ "${BACKUP_DOCKER_VOLUMES}" == "true" && -d "${DOCKER_VOLUMES_DIR}" ]]; then
+        backup_paths+=("${DOCKER_VOLUMES_DIR}")
+    fi
+
+    info "Iniciando backup restic de: ${backup_paths[*]}"
     info "Repositório: ${RESTIC_REPOSITORY}"
 
     local restic_flags=(
         backup
-        "${BACKUP_SOURCE}"
-        "${DB_DUMP_DIR}"
+        "${backup_paths[@]}"
         --exclude-file="${EXCLUDE_FILE}"
         --tag "host=$(hostname -s)"
         --tag "dokploy"
@@ -721,7 +841,7 @@ run_test_restore() {
     if [[ -n "${restored_dump}" ]]; then
         info "Validando integridade do dump restaurado: ${restored_dump}"
         find_pg_container || die "Sem container do Postgres para validar o dump."
-        if pg_exec_i pg_restore --list < "${restored_dump}" >/dev/null 2>>"${LOG_FILE}"; then
+        if pg_exec_i "${PG_CONTAINER}" pg_restore --list < "${restored_dump}" >/dev/null 2>>"${LOG_FILE}"; then
             info "Dump restaurado e íntegro (pg_restore --list OK): ${restored_dump}"
         else
             die "Dump restaurado está CORROMPIDO: ${restored_dump}. FALHA no teste."
@@ -881,6 +1001,7 @@ main() {
     fi
 
     build_exclude_file
+    exclude_db_volumes
     init_repo_if_needed
     dump_databases
     run_backup

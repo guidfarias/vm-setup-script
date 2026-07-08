@@ -249,7 +249,7 @@ create_env_template() {
             if ! grep -q "^DOKPLOY_PG_FILTER=" "${ENV_FILE}"; then
                 log_warn "⚠  Este env não tem variáveis DOKPLOY_* (veio de outra variante?). Ajuste-o:"
                 log_warn "   BACKUP_SOURCE='/etc/dokploy' | DB_DUMP_DIR='/var/backups/db'"
-                log_warn "   DOKPLOY_PG_FILTER='dokploy-postgres' | DOKPLOY_PG_USER='dokploy' | DOKPLOY_PG_DB='dokploy'"
+                log_warn "   DOKPLOY_PG_FILTER='dokploy-postgres' | BACKUP_DOCKER_VOLUMES='true'"
             fi
             return 0
         fi
@@ -270,16 +270,21 @@ S3_PREFIX="$(hostname -s)"
 RESTIC_S3_PREFIX="Restic/$(hostname -s)"
 RESTIC_PASSWORD='SUA_SENHA_RESTIC_FORTE'
 
-# O que entra no backup: configs do Dokploy (Traefik + certificados) e os
-# dumps do banco do painel. Os apps dos clientes são stateless (Git).
+# O que entra no backup: configs do Dokploy (Traefik + certificados), dumps
+# de TODOS os bancos Postgres em containers (painel + clientes, descoberta
+# automática) e os volumes Docker (uploads/persistência dos apps). O código
+# dos apps é reconstruível via Git e fica fora.
 BACKUP_SOURCE='/etc/dokploy'
 DB_DUMP_DIR='/var/backups/db'
 
-# Postgres interno do Dokploy (dump via docker exec — sem senha, o socket
-# local do container é confiável). Ajuste apenas se o Dokploy mudar os nomes.
+# Container do Postgres do PAINEL (obrigatório existir).
 DOKPLOY_PG_FILTER='dokploy-postgres'
-DOKPLOY_PG_USER='dokploy'
-DOKPLOY_PG_DB='dokploy'
+# Regex de IMAGEM para descobrir bancos de clientes. Amplie se usar imagens
+# derivadas: ex. 'postgres|pgvector|timescale'.
+DB_CONTAINER_IMAGE_REGEX='postgres'
+# Volumes Docker no snapshot (os volumes de dados dos bancos ficam fora —
+# já cobertos pelos dumps lógicos).
+BACKUP_DOCKER_VOLUMES='true'
 
 KEEP_DAILY='5'
 KEEP_WEEKLY='4'
