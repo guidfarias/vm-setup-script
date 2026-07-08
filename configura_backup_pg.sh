@@ -278,6 +278,7 @@ for arg in "$@"; do
         --dry-run)      DRY_RUN=true ;;
         --check)        FORCE_CHECK=true ;;
         --test-restore) TEST_RESTORE=true ;;
+        --force-archive) FORCE_ARCHIVE=true ;;
         --help|-h)
             cat <<'HELP'
 Uso:
@@ -285,6 +286,7 @@ Uso:
   bash restic-backup-pg.sh --dry-run        # simula, nada é enviado ao S3
   bash restic-backup-pg.sh --check          # força check de integridade
   bash restic-backup-pg.sh --test-restore   # testa restauração de amostra e sai
+  bash restic-backup.sh --force-archive # força o compactado semanal agora
   FORCE_ARCHIVE=true bash restic-backup-pg.sh
 HELP
             exit 0

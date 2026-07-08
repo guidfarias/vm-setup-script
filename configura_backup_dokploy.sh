@@ -267,6 +267,7 @@ for arg in "$@"; do
         --dry-run)      DRY_RUN=true ;;
         --check)        FORCE_CHECK=true ;;
         --test-restore) TEST_RESTORE=true ;;
+        --force-archive) FORCE_ARCHIVE=true ;;
         --help|-h)
             cat <<'HELP'
 Uso:
@@ -274,6 +275,7 @@ Uso:
   bash restic-backup-dokploy.sh --dry-run        # simula, nada é enviado ao S3
   bash restic-backup-dokploy.sh --check          # força check de integridade
   bash restic-backup-dokploy.sh --test-restore   # testa restauração e sai
+  bash restic-backup.sh --force-archive # força o compactado semanal agora
   FORCE_ARCHIVE=true bash restic-backup-dokploy.sh
 HELP
             exit 0
