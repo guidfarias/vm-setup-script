@@ -167,6 +167,7 @@ status_add_error() {
 EXCLUDE_FILE=""
 RESTORE_TEST_DIR=""
 PG_CONTAINER=""
+REPO_EXISTS="false"
 
 cleanup() {
     # Preserva o código de saída original: como este é o trap de EXIT, o status
@@ -424,6 +425,7 @@ list_db_containers() {
 init_repo_if_needed() {
     if restic cat config &>/dev/null; then
         info "Repositório restic já existe em: ${RESTIC_REPOSITORY}"
+        REPO_EXISTS="true"
         return 0
     fi
 
@@ -435,6 +437,7 @@ init_repo_if_needed() {
     fi
 
     restic init || die "Falha ao inicializar repositório restic."
+    REPO_EXISTS="true"
     info "Repositório inicializado com sucesso."
 }
 
@@ -653,6 +656,10 @@ run_backup() {
     )
 
     if [[ "${DRY_RUN}" == "true" ]]; then
+        if [[ "${REPO_EXISTS}" != "true" ]]; then
+            warn "[DRY-RUN] Repositório ainda não existe (será criado na 1ª execução real). Pulando simulação do backup."
+            return 0
+        fi
         warn "[DRY-RUN] Simulando backup. Nada será enviado ao S3."
         restic "${restic_flags[@]}" --dry-run
         return 0
@@ -768,6 +775,10 @@ run_forget() {
     )
 
     if [[ "${DRY_RUN}" == "true" ]]; then
+        if [[ "${REPO_EXISTS}" != "true" ]]; then
+            warn "[DRY-RUN] Repositório ainda não existe. Pulando simulação da retenção."
+            return 0
+        fi
         warn "[DRY-RUN] Simulando retenção."
         restic "${forget_flags[@]}" --dry-run
         return 0
@@ -872,6 +883,10 @@ run_test_restore() {
 # ---------------------------------------------------------------------------
 
 print_summary() {
+    if [[ "${DRY_RUN}" == "true" && "${REPO_EXISTS}" != "true" ]]; then
+        info "Resumo pulado (repositório ainda não existe)."
+        return 0
+    fi
     info "Resumo dos snapshots:"
     restic snapshots --compact || true
 
