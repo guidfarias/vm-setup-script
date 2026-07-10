@@ -305,6 +305,34 @@ ps aux | grep -E 'restic-backup|restic|aws s3 cp|tar -czf' | grep -v grep
 > ⚠️ **Atenção:** sempre restaure em um diretório temporário (`/tmp/restauracao`)
 > antes de sobrescrever dados de produção. Verifique o conteúdo antes de mover.
 
+### 6.0 — Restauração interativa (recomendada para a equipe)
+
+O instalador disponibiliza o **`restic-restore.sh`**, um assistente com menu que
+funciona nas três variantes (MySQL/RunCloud, PostgreSQL e Dokploy) e detecta o
+formato dos dumps sozinho:
+
+```bash
+sudo restic-restore.sh
+```
+
+O que ele faz:
+
+- **Lista snapshots** e permite escolher qual usar (padrão: o mais recente);
+- **Restaura arquivos/diretórios** navegando pelo conteúdo do snapshot;
+- **Restaura sites completos** (webapps do RunCloud, diretórios de `/var/www`,
+  ou `/etc/dokploy`/volumes Docker no Dokploy) e oferece restaurar o banco associado;
+- **Restaura bancos de dados**: baixa o dump para o staging, valida a integridade
+  (`gzip -t` / `pg_restore --list`) e conduz a importação (MySQL, PostgreSQL local
+  ou PostgreSQL em container Dokploy);
+- **Segurança por padrão**: tudo vai para um staging (`/tmp/restauracao-<data>`);
+  sobrescrever produção ou importar banco exige digitar `SOBRESCREVER`/`IMPORTAR`,
+  mostra uma prévia (dry-run) e oferece **backup preventivo** do estado atual;
+- Log das operações em `/var/log/restic-restore.log`.
+
+As seções 6.1–6.5 abaixo continuam valendo como referência para restauração
+manual via `rr`/`restic` (útil em cenários que o assistente não cobre, como
+restaurar o `/home` inteiro em desastre total).
+
 ### 6.1 — Preparar o ambiente
 
 Com o wrapper `rr` (recomendado), **não é preciso preparar nada** — ele carrega as
@@ -498,6 +526,7 @@ aws s3api get-bucket-lifecycle-configuration --bucket "${S3_BUCKET}" --region "$
 | Backup Restic apenas (sem `.tar.gz`) | `/usr/local/bin/restic-backup.sh` |
 | Simular backup (dry-run) | `/usr/local/bin/restic-backup.sh --dry-run` |
 | **Testar restauração** | `/usr/local/bin/restic-backup.sh --test-restore` |
+| **Restaurar (menu interativo)** | `sudo restic-restore.sh` |
 | Forçar check de integridade | `/usr/local/bin/restic-backup.sh --check` |
 | Listar snapshots Restic | `rr snapshots` |
 | Restaurar último snapshot | `rr restore latest --target /tmp/restauracao` |

@@ -12,7 +12,8 @@
 #      Dokploy detectados.
 #   2. Instala AWS CLI v2 (instalador oficial)
 #   3. Instala restic ${RESTIC_VERSION} (versão fixada e testada)
-#   4. Baixa o restic-backup.sh (variante Dokploy) para /usr/local/bin/
+#   4. Baixa o restic-backup.sh (variante Dokploy), o wrapper 'rr' e o
+#      restic-restore.sh (restauração interativa) para /usr/local/bin/
 #   5. Cria /etc/restic/env a partir de template. NÃO sobrescreve um env já
 #      preenchido; um env que ainda é template sem credenciais É substituído,
 #      com cópia .bak.
@@ -38,9 +39,11 @@ set -euo pipefail
 RESTIC_VERSION="0.17.3"
 GITHUB_RAW="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/configura_backup_dokploy.sh"
 GITHUB_RAW_RR="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/rr.sh"
+GITHUB_RAW_RESTORE="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/restaurar_backup.sh"
 
 SCRIPT_DEST="/usr/local/bin/restic-backup.sh"
 RR_DEST="/usr/local/bin/rr"
+RESTORE_DEST="/usr/local/bin/restic-restore.sh"
 ENV_DIR="/etc/restic"
 ENV_FILE="${ENV_DIR}/env"
 CRON_FILE="/etc/cron.d/restic-backup"
@@ -222,6 +225,15 @@ install_backup_script() {
     else
         log_warn "Não foi possível instalar o wrapper 'rr' (não crítico)."
         rm -f "${RR_DEST}"
+    fi
+
+    # Restauração interativa: menu para restaurar arquivos, volumes e bancos.
+    if curl -fsSL "${GITHUB_RAW_RESTORE}" -o "${RESTORE_DEST}" && bash -n "${RESTORE_DEST}"; then
+        chmod +x "${RESTORE_DEST}"
+        log_info "Restauração interativa instalada em ${RESTORE_DEST} (use: sudo restic-restore.sh)."
+    else
+        log_warn "Não foi possível instalar o restic-restore.sh (não crítico)."
+        rm -f "${RESTORE_DEST}"
     fi
 }
 
@@ -418,6 +430,7 @@ print_final() {
     echo -e "Env:         ${CYAN}${ENV_FILE}${NC}"
     echo -e "Cron:        ${CYAN}${CRON_FILE} (${CRON_SCHEDULE})${NC}"
     [[ -x "${RR_DEST}" ]] && echo -e "Wrapper:     ${CYAN}${RR_DEST}  (ex.: rr snapshots)${NC}"
+    [[ -x "${RESTORE_DEST}" ]] && echo -e "Restauração: ${CYAN}sudo restic-restore.sh  (menu interativo)${NC}"
     echo
 
     if [[ "${ENV_IS_TEMPLATE:-false}" == "true" ]]; then
@@ -427,6 +440,7 @@ print_final() {
         echo -e "                               ${CYAN}sudo bash $0${NC}"
     else
         echo -e "Listar snapshots:                ${CYAN}rr snapshots${NC}"
+        echo -e "Restaurar (menu interativo):     ${CYAN}sudo restic-restore.sh${NC}"
         echo -e "Teste de restore quando quiser:  ${CYAN}${SCRIPT_DEST} --test-restore${NC}"
     fi
     echo
