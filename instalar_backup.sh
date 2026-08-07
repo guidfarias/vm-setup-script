@@ -277,17 +277,20 @@ install_backup_script() {
     fi
 
     # Wrapper forced-command do usuário hubrestore (restauração remota via HUB).
-    # Baixa para um temporário e só substitui o destino em caso de sucesso —
-    # uma falha de rede numa reexecução não pode apagar um wrapper funcional.
+    # Baixa para um temporário NO MESMO DIRETÓRIO do destino (garante que o
+    # mv final seja atômico — rename, não copy+delete) e só substitui em
+    # caso de sucesso: uma falha de rede numa reexecução não pode apagar um
+    # wrapper funcional.
     local hub_shell_tmp
-    hub_shell_tmp="$(mktemp)"
+    hub_shell_tmp="$(mktemp "$(dirname "${HUB_SHELL_DEST}")/.hub-restore-shell.XXXXXX")"
     if curl -fsSL "${GITHUB_RAW_HUB_SHELL}" -o "${hub_shell_tmp}" && bash -n "${hub_shell_tmp}"; then
-        install -m 755 "${hub_shell_tmp}" "${HUB_SHELL_DEST}"
+        chmod 755 "${hub_shell_tmp}"
+        mv -f "${hub_shell_tmp}" "${HUB_SHELL_DEST}"
         log_info "Wrapper hub-restore-shell instalado em ${HUB_SHELL_DEST}."
     else
         log_warn "Não foi possível baixar o hub-restore-shell (não crítico; mantendo versão existente, se houver)."
+        rm -f "${hub_shell_tmp}"
     fi
-    rm -f "${hub_shell_tmp}"
 }
 
 # ---------------------------------------------------------------------------
@@ -456,11 +459,29 @@ run_first_backup() {
 provision_hubrestore_user() {
     log_step "9/9 — Provisionando usuário ${HUBRESTORE_USER} (restauração remota HUB)"
 
+    # Sem o wrapper instalado, sudoers/authorized_keys apontariam para um
+    # binário inexistente — melhor não provisionar nada do que provisionar
+    # acesso quebrado.
+    if [[ ! -x "${HUB_SHELL_DEST}" ]]; then
+        log_error "${HUB_SHELL_DEST} ausente ou não executável — pulando todo o provisionamento de ${HUBRESTORE_USER}."
+        log_error "Rode de novo (o instalador tenta baixar o wrapper de novo automaticamente)."
+        return 0
+    fi
+
+    # Shell precisa ser um shell de verdade: o sshd invoca
+    # "<shell> -c '<forced-command>'" para rodar o command= do
+    # authorized_keys. Com nologin o wrapper nunca executa. A restrição
+    # de acesso vem do command= + sudoers, não do shell da conta.
     if id -u "${HUBRESTORE_USER}" &>/dev/null; then
         log_info "Usuário ${HUBRESTORE_USER} já existe. Pulando criação."
+        if [[ "$(getent passwd "${HUBRESTORE_USER}" | cut -d: -f7)" != "/bin/bash" ]]; then
+            chsh -s /bin/bash "${HUBRESTORE_USER}" \
+                || die "Falha ao ajustar o shell de ${HUBRESTORE_USER} para /bin/bash."
+            log_info "Shell de ${HUBRESTORE_USER} corrigido para /bin/bash."
+        fi
     else
         useradd --system --create-home --home-dir "${HUBRESTORE_HOME}" \
-            --shell /usr/sbin/nologin "${HUBRESTORE_USER}" \
+            --shell /bin/bash "${HUBRESTORE_USER}" \
             || die "Falha ao criar o usuário ${HUBRESTORE_USER}."
         passwd -l "${HUBRESTORE_USER}" &>/dev/null || true
         log_info "Usuário ${HUBRESTORE_USER} criado (sem senha, home ${HUBRESTORE_HOME})."
@@ -497,13 +518,20 @@ provision_hubrestore_user() {
         return 0
     fi
 
-    # Valida que é mesmo uma chave pública SSH antes de gravar no authorized_keys.
-    local key_check_file
+    # Valida que é EXATAMENTE UMA chave pública SSH antes de gravar no
+    # authorized_keys. Entrada multi-linha com uma chave válida na 1ª linha
+    # passaria despercebida no ssh-keygen -l e gravaria uma 2ª chave SEM as
+    # opções de forced-command — buraco de segurança.
+    if [[ "${HUB_PUBKEY}" == *$'\n'* ]]; then
+        die "--hub-pubkey deve ser uma única linha (uma única chave). Valor recebido tem quebra de linha."
+    fi
+    local key_check_file key_count
     key_check_file="$(mktemp)"
     printf '%s\n' "${HUB_PUBKEY}" > "${key_check_file}"
-    if ! ssh-keygen -l -f "${key_check_file}" &>/dev/null; then
+    key_count="$(ssh-keygen -l -f "${key_check_file}" 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${key_count}" != "1" ]]; then
         rm -f "${key_check_file}"
-        die "--hub-pubkey não é uma chave pública SSH válida: ${HUB_PUBKEY}"
+        die "--hub-pubkey não é uma única chave pública SSH válida: ${HUB_PUBKEY}"
     fi
     rm -f "${key_check_file}"
 

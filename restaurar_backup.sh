@@ -85,9 +85,11 @@ RESTORE_STAGING_BASE="${RESTORE_STAGING_BASE:-/tmp/restauracao}"
 # Limite de itens exibidos por diretório na navegação (diretórios gigantes).
 RESTORE_LS_LIMIT="${RESTORE_LS_LIMIT:-300}"
 
-# Modo não-interativo (disparado pelo HUB via hub-restore-shell).
-HUB_JOB_LOG_DIR="${HUB_JOB_LOG_DIR:-/var/log/hub-restore}"
-HUB_JOB_STATUS_DIR="${HUB_JOB_STATUS_DIR:-/var/lib/hub-restore}"
+# Modo não-interativo (disparado pelo HUB via hub-restore-shell). Caminhos
+# fixos de propósito — precisam bater exatamente com o que hub-restore-shell
+# lê; um override por ambiente aqui e não lá (ou vice-versa) quebra o wrapper.
+readonly HUB_JOB_LOG_DIR="/var/log/hub-restore"
+readonly HUB_JOB_STATUS_DIR="/var/lib/hub-restore"
 
 # ---------------------------------------------------------------------------
 # ESTADO INTERNO / LIMPEZA
@@ -1296,8 +1298,11 @@ Variáveis opcionais (defina antes de rodar, se precisar):
   RESTIC_ENV_FILE=/outro/env       env alternativo (padrão /etc/restic/env)
   RESTORE_STAGING_BASE=/dir/base   base do staging (padrão /tmp/restauracao)
   RESTORE_LOG_FILE=/arquivo.log    log (padrão /var/log/restic-restore.log)
-  HUB_JOB_LOG_DIR=/dir             log dos jobs do HUB (padrão /var/log/hub-restore)
-  HUB_JOB_STATUS_DIR=/dir          status dos jobs do HUB (padrão /var/lib/hub-restore)
+
+Modo --non-interactive usa caminhos fixos (não configuráveis, para bater
+com o wrapper hub-restore-shell):
+  log:    /var/log/hub-restore/<job_id>.log
+  status: /var/lib/hub-restore/<job_id>.status
 HELP
 }
 
