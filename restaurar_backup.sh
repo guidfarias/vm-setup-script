@@ -1328,6 +1328,13 @@ main() {
         return
     fi
 
+    # --snapshot/--job só têm efeito junto com --non-interactive; fora dele
+    # são combinação inválida (evita ignorar o valor silenciosamente).
+    if [[ -n "${snap_arg}" || -n "${job_arg}" ]]; then
+        echo "--snapshot/--job exigem --non-interactive" >&2
+        exit 1
+    fi
+
     require_root
     load_env_file
     validate_env
