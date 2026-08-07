@@ -1199,7 +1199,7 @@ valid_job_id() {
 }
 
 valid_snapshot_id() {
-    [[ "$1" == "latest" || "$1" =~ ^[0-9a-f]{8,64}$ ]]
+    [[ "$1" =~ ^[0-9a-f]{8,64}$ ]]
 }
 
 hub_job_log_file()    { echo "${HUB_JOB_LOG_DIR}/${1}.log"; }
@@ -1211,7 +1211,8 @@ write_job_status() {
     status_file="$(hub_job_status_file "${job_id}")"
     tmp="$(mktemp "${HUB_JOB_STATUS_DIR}/.${job_id}.XXXXXX")"
     printf '%s\n' "${line}" > "${tmp}"
-    chmod 644 "${tmp}"
+    chgrp hubrestore "${tmp}" 2>/dev/null || true
+    chmod 640 "${tmp}"
     mv -f "${tmp}" "${status_file}"
 }
 
@@ -1222,6 +1223,9 @@ run_non_interactive() {
 
     mkdir -p "${HUB_JOB_LOG_DIR}" "${HUB_JOB_STATUS_DIR}" \
         || die "Não foi possível criar ${HUB_JOB_LOG_DIR}/${HUB_JOB_STATUS_DIR}."
+    # Grupo hubrestore precisa LER (não escrever) — o wrapper hub-restore-shell
+    # roda como hubrestore e só faz `cat` nesses arquivos/dirs.
+    chgrp hubrestore "${HUB_JOB_LOG_DIR}" "${HUB_JOB_STATUS_DIR}" 2>/dev/null || true
     chmod 750 "${HUB_JOB_LOG_DIR}" "${HUB_JOB_STATUS_DIR}" 2>/dev/null || true
 
     valid_job_id "${job_id}"  || die "job_id inválido: ${job_id}"
@@ -1229,6 +1233,7 @@ run_non_interactive() {
 
     RESTORE_LOG_FILE="$(hub_job_log_file "${job_id}")"
     : > "${RESTORE_LOG_FILE}" 2>/dev/null || true
+    chgrp hubrestore "${RESTORE_LOG_FILE}" 2>/dev/null || true
     chmod 640 "${RESTORE_LOG_FILE}" 2>/dev/null || true
 
     write_job_status "${job_id}" "running"

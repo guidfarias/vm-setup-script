@@ -277,13 +277,17 @@ install_backup_script() {
     fi
 
     # Wrapper forced-command do usuário hubrestore (restauração remota via HUB).
-    if curl -fsSL "${GITHUB_RAW_HUB_SHELL}" -o "${HUB_SHELL_DEST}" && bash -n "${HUB_SHELL_DEST}"; then
-        chmod +x "${HUB_SHELL_DEST}"
+    # Baixa para um temporário e só substitui o destino em caso de sucesso —
+    # uma falha de rede numa reexecução não pode apagar um wrapper funcional.
+    local hub_shell_tmp
+    hub_shell_tmp="$(mktemp)"
+    if curl -fsSL "${GITHUB_RAW_HUB_SHELL}" -o "${hub_shell_tmp}" && bash -n "${hub_shell_tmp}"; then
+        install -m 755 "${hub_shell_tmp}" "${HUB_SHELL_DEST}"
         log_info "Wrapper hub-restore-shell instalado em ${HUB_SHELL_DEST}."
     else
-        log_warn "Não foi possível instalar o hub-restore-shell (não crítico; hubrestore ficará sem acesso)."
-        rm -f "${HUB_SHELL_DEST}"
+        log_warn "Não foi possível baixar o hub-restore-shell (não crítico; mantendo versão existente, se houver)."
     fi
+    rm -f "${hub_shell_tmp}"
 }
 
 # ---------------------------------------------------------------------------
@@ -492,6 +496,16 @@ provision_hubrestore_user() {
         log_warn "Rode de novo com:  sudo bash $0 --hub-pubkey \"ssh-ed25519 AAAA... hub\""
         return 0
     fi
+
+    # Valida que é mesmo uma chave pública SSH antes de gravar no authorized_keys.
+    local key_check_file
+    key_check_file="$(mktemp)"
+    printf '%s\n' "${HUB_PUBKEY}" > "${key_check_file}"
+    if ! ssh-keygen -l -f "${key_check_file}" &>/dev/null; then
+        rm -f "${key_check_file}"
+        die "--hub-pubkey não é uma chave pública SSH válida: ${HUB_PUBKEY}"
+    fi
+    rm -f "${key_check_file}"
 
     local key_line="command=\"${HUB_SHELL_DEST}\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ${HUB_PUBKEY}"
     if [[ -f "${auth_keys}" ]] && grep -qxF "${key_line}" "${auth_keys}"; then

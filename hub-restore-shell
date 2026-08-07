@@ -19,9 +19,11 @@
 
 set -uo pipefail
 
-RESTORE_BIN="${RESTORE_BIN:-/usr/local/bin/restic-restore.sh}"
-HUB_JOB_LOG_DIR="${HUB_JOB_LOG_DIR:-/var/log/hub-restore}"
-HUB_JOB_STATUS_DIR="${HUB_JOB_STATUS_DIR:-/var/lib/hub-restore}"
+# Caminhos fixos de propósito — wrapper de segurança não deve aceitar
+# overrides por ambiente (isso ampliaria a superfície de ataque via SSH).
+readonly RESTORE_BIN="/usr/local/bin/restic-restore.sh"
+readonly HUB_JOB_LOG_DIR="/var/log/hub-restore"
+readonly HUB_JOB_STATUS_DIR="/var/lib/hub-restore"
 
 SNAPSHOT_RE='^[0-9a-f]{8,64}$'
 JOB_RE='^[A-Za-z0-9-]{1,64}$'
