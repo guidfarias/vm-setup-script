@@ -99,7 +99,7 @@ HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 STATUS_LOCAL_FILE="${STATUS_LOCAL_FILE:-/var/log/restic-status.json}"
 # Prefixo (pasta) no S3 onde os JSONs de status são gravados.
 STATUS_S3_PREFIX="${STATUS_S3_PREFIX:-Monitoramento}"
-STATUS_SCRIPT_VERSION="2026-07"
+STATUS_SCRIPT_VERSION="2026-08"
 
 STATUS_STARTED_AT=""          # ISO8601 do início
 STATUS_DB_OK=0
@@ -110,6 +110,7 @@ STATUS_ARCHIVE_APPS_FAIL=0
 STATUS_SNAPSHOT_ID=""
 STATUS_REPO_SIZE=""
 STATUS_SNAPSHOTS_TOTAL=""
+STATUS_SNAPSHOTS_JSON=""
 STATUS_CHECK_RAN="false"
 STATUS_ERRORS=()              # array de mensagens de erro/aviso relevantes
 STATUS_WRITTEN="false"        # evita escrever duas vezes
@@ -823,6 +824,206 @@ print_summary() {
         | grep -i 'Total Size' | sed 's/.*:[[:space:]]*//' || true)"
 }
 
+# Reduz a saída JSON do restic aos campos públicos do monitoramento. O parser
+# usa apenas awk, já disponível no servidor, e preserva os valores JSON originais
+# para não precisar reimplementar escape de strings ou arrays de paths.
+build_snapshots_json() {
+    awk '
+    function is_json_space(c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n"
+    }
+
+    function json_string_end(s, start,    j, c, escaped) {
+        escaped = 0
+        for (j = start + 1; j <= length(s); j++) {
+            c = substr(s, j, 1)
+            if (escaped) {
+                escaped = 0
+            } else if (c == "\\") {
+                escaped = 1
+            } else if (c == "\"") {
+                return j
+            }
+        }
+        return 0
+    }
+
+    function json_array_end(s, start,    j, c, depth, end) {
+        depth = 0
+        for (j = start; j <= length(s); j++) {
+            c = substr(s, j, 1)
+            if (c == "\"") {
+                end = json_string_end(s, j)
+                if (end == 0) {
+                    return 0
+                }
+                j = end
+            } else if (c == "[") {
+                depth++
+            } else if (c == "]") {
+                depth--
+                if (depth == 0) {
+                    return j
+                }
+                if (depth < 0) {
+                    return 0
+                }
+            }
+        }
+        return 0
+    }
+
+    function reset_snapshot() {
+        snapshot_short_id = ""
+        snapshot_time = ""
+        snapshot_paths = ""
+        have_short_id = 0
+        have_time = 0
+        have_paths = 0
+    }
+
+    function emit_snapshot() {
+        if (!have_short_id || !have_time || !have_paths) {
+            parse_error = 1
+            return
+        }
+        if (snapshot_count > 0) {
+            snapshots_json = snapshots_json ","
+        }
+        snapshots_json = snapshots_json "{\"short_id\":" snapshot_short_id \
+            ",\"time\":" snapshot_time \
+            ",\"paths\":" snapshot_paths "}"
+        snapshot_count++
+    }
+
+    {
+        input = input $0
+    }
+
+    END {
+        input_length = length(input)
+        snapshots_json = "["
+
+        first = 1
+        while (first <= input_length && is_json_space(substr(input, first, 1))) {
+            first++
+        }
+        if (first > input_length || substr(input, first, 1) != "[") {
+            parse_error = 1
+        }
+
+        for (i = 1; i <= input_length && !parse_error; i++) {
+            c = substr(input, i, 1)
+
+            if (c == "\"") {
+                end = json_string_end(input, i)
+                if (end == 0) {
+                    parse_error = 1
+                    break
+                }
+
+                # Only strings followed by a colon at snapshot-object depth
+                # can be the fields we want to copy.
+                if (curly_depth == 1 && array_depth == 1) {
+                    next_pos = end + 1
+                    while (next_pos <= input_length && is_json_space(substr(input, next_pos, 1))) {
+                        next_pos++
+                    }
+                    if (substr(input, next_pos, 1) == ":") {
+                        key = substr(input, i + 1, end - i - 1)
+                        value = next_pos + 1
+                        while (value <= input_length && is_json_space(substr(input, value, 1))) {
+                            value++
+                        }
+
+                        if (key == "short_id" || key == "time") {
+                            if (substr(input, value, 1) != "\"") {
+                                parse_error = 1
+                                break
+                            }
+                            value_end = json_string_end(input, value)
+                            if (value_end == 0) {
+                                parse_error = 1
+                                break
+                            }
+                            if (key == "short_id") {
+                                snapshot_short_id = substr(input, value, value_end - value + 1)
+                                have_short_id = 1
+                            } else {
+                                snapshot_time = substr(input, value, value_end - value + 1)
+                                have_time = 1
+                            }
+                        } else if (key == "paths") {
+                            if (substr(input, value, 1) != "[") {
+                                parse_error = 1
+                                break
+                            }
+                            value_end = json_array_end(input, value)
+                            if (value_end == 0) {
+                                parse_error = 1
+                                break
+                            }
+                            snapshot_paths = substr(input, value, value_end - value + 1)
+                            have_paths = 1
+                        }
+                    }
+                }
+
+                i = end
+                continue
+            }
+
+            if (c == "[") {
+                array_depth++
+            } else if (c == "]") {
+                array_depth--
+                if (array_depth < 0) {
+                    parse_error = 1
+                }
+            } else if (c == "{") {
+                if (curly_depth == 0 && array_depth == 1) {
+                    reset_snapshot()
+                }
+                curly_depth++
+            } else if (c == "}") {
+                if (curly_depth <= 0) {
+                    parse_error = 1
+                } else {
+                    if (curly_depth == 1 && array_depth == 1) {
+                        emit_snapshot()
+                    }
+                    curly_depth--
+                }
+            }
+        }
+
+        if (curly_depth != 0 || array_depth != 0 || parse_error) {
+            exit 1
+        }
+        print snapshots_json "]"
+    }
+    '
+}
+
+# Lista snapshots sem afetar o resultado do backup. Em caso de falha, o campo
+# fica ausente e a mensagem é publicada no array de erros do monitoramento.
+collect_status_snapshots() {
+    [[ "${DRY_RUN}" == "true" ]] && return 0
+
+    local snapshots_raw
+    if ! snapshots_raw="$(restic snapshots --json 2>>"${LOG_FILE}")"; then
+        warn "Falha ao listar snapshots restic para o status; campo snapshots omitido."
+        status_add_error "Falha ao listar snapshots restic para o status"
+        return 0
+    fi
+
+    if ! STATUS_SNAPSHOTS_JSON="$(printf '%s\n' "${snapshots_raw}" | build_snapshots_json)"; then
+        warn "Falha ao processar snapshots restic para o status; campo snapshots omitido."
+        STATUS_SNAPSHOTS_JSON=""
+        status_add_error "Falha ao processar snapshots restic para o status"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # STATUS JSON — grava o resultado do backup localmente e no S3
 # ---------------------------------------------------------------------------
@@ -861,11 +1062,15 @@ write_status() {
     [[ "${TEST_RESTORE}" == "true" ]] && return 0
 
     local overall="$1"
-    local host finished_at started errors_json
+    local host finished_at started errors_json snapshots_field
     host="$(hostname -s)"
     finished_at="$(date '+%Y-%m-%dT%H:%M:%S%z')"
     started="${STATUS_STARTED_AT:-${finished_at}}"
     errors_json="$(build_errors_json)"
+    snapshots_field=""
+    if [[ -n "${STATUS_SNAPSHOTS_JSON}" ]]; then
+        snapshots_field="  \"snapshots\": ${STATUS_SNAPSHOTS_JSON},"
+    fi
 
     # duração em segundos (se conseguimos parsear started).
     local dur="null" s_epoch f_epoch
@@ -888,6 +1093,7 @@ write_status() {
   "restic_snapshot_id": "$(json_escape "${STATUS_SNAPSHOT_ID}")",
   "repo_size": "$(json_escape "${STATUS_REPO_SIZE}")",
   "snapshots_total": "$(json_escape "${STATUS_SNAPSHOTS_TOTAL}")",
+${snapshots_field}
   "check_ran": ${STATUS_CHECK_RAN},
   "errors": ${errors_json},
   "script_version": "$(json_escape "${STATUS_SCRIPT_VERSION}")"
@@ -964,6 +1170,7 @@ main() {
     run_forget
     run_check
     print_summary
+    collect_status_snapshots
 
     info "════════════════════════════════════════════"
     info "Backup finalizado | host: $(hostname -s) | data: $(date '+%Y-%m-%d %H:%M:%S')"
