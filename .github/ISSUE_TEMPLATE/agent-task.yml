@@ -1,0 +1,150 @@
+name: Agent task
+description: Unidade de trabalho executável por um agente, sem contexto implícito.
+title: '<verbo no imperativo> <objeto específico>'
+labels: ['status:ready']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **O issue é a fonte de verdade.** Antes de editar, o agente confirma o
+        plano e os arquivos previstos. Lacunas materiais voltam para decisão;
+        consequências diretas podem seguir com justificativa no PR.
+
+        Preencha os campos obrigatórios com concisão. O resto é opcional — use
+        somente quando fizer diferença para execução ou verificação.
+
+        Dependências não vão no corpo: use `Relationships → Mark as blocked by`.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Qual é o problema e por que resolver agora.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: O que este issue faz e qual o comportamento esperado depois do merge.
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of scope
+      description: O que explicitamente NÃO entra. É o campo mais barato e o que mais evita PR gigante.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_files
+    attributes:
+      label: Expected files
+      description: >
+        Previsão não exaustiva após inspeção do repositório. Inclua testes e
+        marque arquivos novos. Testes, tipos, fixtures, snapshots, estilos e
+        imports/exports diretamente necessários podem ser adicionados com
+        justificativa no PR; contrato público, schema, dependência, autenticação,
+        permissão ou comportamento novo exigem decisão.
+      placeholder: |
+        - caminho/do/arquivo.ext
+        - caminho/do/arquivo-novo.ext (novo)
+        - caminho/do/teste.ext
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: >
+        Normalmente 6–10 resultados que uma máquina consegue responder sim ou
+        não. Permutações e casos de borda ficam em Test scenarios.
+      value: |
+        - [ ]
+        - [ ]
+        - [ ] O precommit e os testes afetados passam
+    validations:
+      required: true
+
+  - type: dropdown
+    id: points
+    attributes:
+      label: Points
+      description: >
+        Estima somente tamanho/esforço: 1 local, 2 pequeno, 3 não trivial, 5
+        amplo mas coeso. Não escolha pontos para comprar modelo; risco é separado.
+      options: ['1', '2', '3', '5']
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      description: >
+        Mede impacto e necessidade de julgamento, independentemente do tamanho.
+        Flagged inclui contrato público, persistência, mutação ou UX ambígua;
+        Critical inclui segurança, autorização, dados destrutivos ou rollout crítico.
+      options:
+        - Routine
+        - Flagged
+        - Critical
+    validations:
+      required: true
+
+  - type: dropdown
+    id: preview
+    attributes:
+      label: Preview
+      description: >
+        Required para mudança visual/interativa que precisa de localhost para
+        revisão humana. O worker apresenta o preview e para antes de commit/PR
+        até a aprovação visual; Not required para trabalho sem resultado visual.
+      options:
+        - Not required
+        - Required
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical_details
+    attributes:
+      label: Technical details
+      description: >
+        Opcional. Decisões já tomadas, nomes de módulo/serviço, contratos.
+        Se este issue PRODUZ um contrato consumido por outro, escreva o contrato inteiro aqui.
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test scenarios
+      description: Opcional, mas recomendado. Casos de borda que o agente pode não imaginar sozinho.
+
+  - type: textarea
+    id: rollout
+    attributes:
+      label: Rollout & kill switch
+      description: Opcional. Preencha quando houver risco — a flag nasce OFF.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Outras notas
+      description: Opcional. Métricas, i18n, privacidade, o que for aplicável.
+
+  - type: checkboxes
+    id: gate
+    attributes:
+      label: Antes de criar
+      options:
+        - label: >
+            Dependências estão em Relationships (se houver), isto cabe em UM PR
+            revisável, decisões materiais de produto/UX foram aprovadas e os
+            testes fazem parte deste ticket. Se Preview é Required, a label
+            preview:required foi aplicada e estados/viewports de revisão estão
+            descritos no Scope ou Acceptance criteria.
+          required: true

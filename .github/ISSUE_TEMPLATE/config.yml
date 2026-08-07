@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ideia / discussão (ainda não é uma task)
+    url: https://github.com/guidfarias/vm-setup-script/discussions
+    about: >
+      Se ainda não dá para escrever escopo, arquivos e acceptance criteria,
+      não abra um Agent task — o orquestrador não consegue transformar isso
+      em prompt. Discuta primeiro.

@@ -1,0 +1,274 @@
+# .orchestrate.yml — contrato de execução do repositório
+# Fica na raiz do repo. É o único lugar onde a skill aprende os comandos
+# do projeto e qual runner usar. Sem ele a skill não adivinha: ela propõe
+# e pede confirmação.
+
+version: 2
+
+repo:
+  slug: owner/name          # opcional; default = remote origin
+  default_branch: main
+  branch_pattern: "{issue}-{slug}"   # ex.: 142-recurring-transactions
+
+# ---------------------------------------------------------------------------
+# RUNNER — quem cria o worktree e roda o agente
+# ---------------------------------------------------------------------------
+runner:
+  kind: orca                # orca | conductor
+  # orca      → spawn programático via CLI. Melhor para backend / lote grande.
+  # conductor → workspace com porta própria ($CONDUCTOR_PORT) e preview.
+  #             Melhor para front. NÃO tem CLI: o spawn é por deep link e
+  #             você confirma na GUI.
+
+  orca:
+    parent: current         # worktree pai = o worktree de onde a skill roda
+    base_ref: origin/main
+
+  conductor:
+    # Precisa de .conductor/settings.toml no repo (veja assets/conductor.settings.toml).
+    # A skill NÃO cria workspace sozinha: ela gera o prompt e o deep link.
+    deep_link: true         # abre `conductor://` automaticamente (macOS)
+    confirm_each: true      # pausa e espera você confirmar cada spawn
+
+# ---------------------------------------------------------------------------
+# PREVIEW — somente issues explicitamente marcadas para revisão visual
+# ---------------------------------------------------------------------------
+preview:
+  enabled: true
+  required_label: "preview:required"
+  # Placeholders permitidos: {issue} e {port}. O comando deve manter reload
+  # automático e escutar apenas em loopback por padrão.
+  command: "pnpm preview:agent -- --port {port}"
+  port_base: 5200
+  port_modulo: 300
+  url: "http://127.0.0.1:{port}/"
+  health_url: "http://127.0.0.1:{port}/health"
+  startup_timeout_seconds: 90
+  open_in_runner: true
+  # Preview obrigatório para antes de commit/PR e aguarda sua aprovação visual.
+  # Só use false quando o PR for deliberadamente o primeiro artefato de revisão.
+  approval_gate: true
+
+# ---------------------------------------------------------------------------
+# AGENTES
+# ---------------------------------------------------------------------------
+agents:
+  # Tier usado quando nenhuma regra casa.
+  default: terra-high
+
+  # ORDEM DOS TIERS, do mais barato ao mais forte. É esta lista que define o
+  # que "subir um nível" significa.
+  tiers: [luna-medium, terra-high, terra-xhigh, sol-high]
+
+  # Alternativas de orçamento equivalentes ao perfil. Nunca são escolhidas
+  # silenciosamente: exigem override, label ou aprovação na tabela da onda.
+  alternates:
+    terra-high: [sonnet]
+
+  # ROTEAMENTO POR TICKET.
+  # Points mede tamanho; Risk mede impacto/julgamento. Primeira regra de Points
+  # que casar vence; depois Risk pode subir o perfil.
+  routing:
+    rules:
+      - points: [1, 2]
+        use: luna-medium
+      - points: [3, 5]
+        use: terra-high
+
+    escalate_on_risk:
+      Routine: 0
+      Flagged: 1
+      Critical: 2
+
+    # Labels que sobem N níveis na lista `tiers` (nunca passa do último).
+    # A chave precisa de aspas porque tem dois-pontos no nome.
+    escalate_on_labels:
+      "risk:flagged": 1
+      "risk:critical": 2
+
+    worker_overrides:
+      "agent:sonnet": sonnet
+
+  preflight:
+    required: true
+    allow_adjacent: [tests, types, fixtures, snapshots, styles, imports, exports]
+    escalate_on: [public-contract, schema, dependency, authentication, permission, unspecified-behavior]
+
+  # Quem babysita o PR. `same` = o mesmo executor, no mesmo worktree.
+  babysitter: same
+
+  # Comandos reais de cada tier. CONFIRME cada um na sua máquina antes de
+  # confiar: identificadores de modelo mudam e a CLI falha silenciosamente
+  # quando o modelo não existe.
+  #
+  # SOBRE O SANDBOX — este é o padrão. Use igual em todos os projetos.
+  #
+  # `-s workspace-write -a never` é a única forma que FUNCIONA de ponta a ponta.
+  # `--dangerously-bypass-approvals-and-sandbox` é BLOQUEADO pelo classificador
+  # de permissão do Claude Code: o orquestrador tenta lançar, a chamada é negada,
+  # e a onda inteira termina sem nada feito (aconteceu em 31/07/2026, a noite
+  # toda, três agentes, zero PRs).
+  #
+  # Para o sandbox não estrangular o agente, o que precisa ser aberto NÃO fica
+  # aqui — fica uma vez só em `~/.codex/config.toml`, na máquina:
+  #
+  #   [sandbox_workspace_write]
+  #   network_access = true          # registry do npm/pnpm + api.github.com
+  #   writable_roots = [
+  #     "/Users/<voce>/<pasta-dos-worktrees>",   # o .git real mora no repo pai
+  #     "/Users/<voce>/<pasta-dos-projetos>",
+  #     "/Users/<voce>/.npm",
+  #     "/Users/<voce>/.config/gh",              # o gh precisa escrever o token
+  #     "<saida de: pnpm store path>",           # se o projeto usa pnpm
+  #   ]
+  #
+  # Sem esses quatro caminhos o agente nasce decorativo: install falha por DNS,
+  # commit falha por não criar o index.lock, e o `gh` não alcança o GitHub.
+  #
+  # Teste À MÃO antes de confiar, dentro de um worktree:
+  #   codex -s workspace-write -a never
+  #   > rode `pnpm install` e depois `git status`
+  commands:
+    luna-medium: 'codex --model gpt-5.6-luna -c model_reasoning_effort="medium" -s workspace-write -a never'
+    terra-high: 'codex --model gpt-5.6-terra -c model_reasoning_effort="high" -s workspace-write -a never'
+    terra-xhigh: 'codex --model gpt-5.6-terra -c model_reasoning_effort="xhigh" -s workspace-write -a never'
+    sol-high:  'codex --model gpt-5.6-sol -c model_reasoning_effort="high" -s workspace-write -a never'
+    sonnet: 'claude --model sonnet'
+
+coordinator:
+  # O orquestrador é o modelo da sessão onde você roda /orchestrate-project.
+  # Terra coordena o fluxo normal; Sol fica para Critical, arquitetura ainda
+  # ambígua ou fan-in de alto risco. Sonnet pode coordenar se a skill também
+  # estiver instalada no ambiente Claude.
+  recommended: terra-high
+  critical: sol-high
+  alternate: sonnet
+
+# ---------------------------------------------------------------------------
+# COMANDOS DO PROJETO
+# ---------------------------------------------------------------------------
+commands:
+  # Rodado uma vez no setup do worktree/workspace
+  install: ""
+  # Portão local antes do commit. Deve ser IDÊNTICO ao que o CI roda.
+  precommit: ""
+  # Suíte completa
+  test: ""
+  # Suíte escopada (o agente usa durante a iteração). {file} é substituído.
+  test_file: ""
+  # Autofix que o orquestrador pode rodar sozinho num CI vermelho trivial
+  format: ""
+  # Servidor de dev manual. O preview orquestrado usa o bloco `preview`.
+  dev: ""
+
+pr:
+  base: main
+  draft: false
+  body_requires:
+    - "Closes #"
+    - "## Summary"
+    - "## Test plan"
+
+labels:
+  ready: "status:ready"
+  in_progress: "status:in-progress"
+  in_review: "status:in-review"
+  blocked: "status:blocked"
+  preview_required: "preview:required"
+
+# ---------------------------------------------------------------------------
+# VERIFICAÇÃO — subagente de contexto limpo, um por PR que fica verde
+# ---------------------------------------------------------------------------
+verify:
+  enabled: true
+
+  # MODELO DO VERIFICADOR — e cuidado, isto NÃO é um tier.
+  #
+  # `agents.tiers` são comandos de CLI, para agente que roda em worktree. O
+  # verificador é subagente da sessão: ele recebe identificador de modelo, não
+  # linha de comando. Um tier escrito aqui é config que não pode ser aplicada,
+  # e vira campo decorativo — pior que campo ausente, porque você acredita que
+  # configurou.
+  #
+  # Se puser um modelo explícito, a skill tem que passá-lo no despacho — e é
+  # obrigada a reportar qual modelo verificou de fato, mesmo quando não
+  # conseguiu honrar o pedido.
+  model: gpt-5.6-terra
+  reasoning_effort: high
+
+  # O relatório do verificador vai como comentário no PR, cru, sempre — nos dois
+  # veredictos. É a única evidência que sobrevive ao fim da sessão, e ela
+  # sobrevive também ao squash merge.
+  comment_on_pr: true
+  # Quanto o coordenador lê de cada agente enquanto ele trabalha:
+  #   markers  → só as linhas AGENT # (plano, bloqueio, entrega)   ← recomendado
+  #   final    → só a entrega
+  #   full     → a transcrição inteira (caro; log de build queima token à toa)
+  conduct: markers
+  # Quantos minutos sem marcador E sem commit até tratar a thread como travada.
+  # Este é o único detector para o agente que nunca começou — ele não produz
+  # CI vermelho, então o canal do GitHub nunca vai reclamar dele.
+  silent_stall_minutes: 20
+
+babysit:
+  enabled: true
+  # Ciclos de correção antes de escalar para você. O upstream da OpenAI usa 3.
+  max_cycles: 3
+  poll_seconds: 60
+  # Bots que o babysitter espera antes de considerar o review limpo
+  await_bots: ["coderabbitai[bot]"]
+  grace_period_seconds: 300
+  # NUNCA true. O merge é o quality gate humano deste fluxo.
+  auto_merge: false
+
+hooks:
+  post_merge:
+    - "Rodar backfill se o issue tocou **/backfills/*"
+    - "Sincronizar docs se o issue tocou docs/*"
+
+# ---------------------------------------------------------------------------
+# BLOCOS PRONTOS — copie o `commands:` do seu stack
+# ---------------------------------------------------------------------------
+
+# --- Vue 3 + Vite + TS (pnpm) — runner: conductor ---
+# commands:
+#   install: pnpm install --frozen-lockfile
+#   precommit: pnpm lint && pnpm vue-tsc --noEmit && pnpm build
+#   test: pnpm vitest run
+#   test_file: pnpm vitest run {file}
+#   format: pnpm prettier --write .
+#   dev: pnpm dev --port $CONDUCTOR_PORT
+
+# --- TypeScript / Node (pnpm) ---
+# commands:
+#   install: pnpm install --frozen-lockfile
+#   precommit: pnpm lint && pnpm typecheck && pnpm format:check
+#   test: pnpm test -- --run
+#   test_file: pnpm test -- --run {file}
+#   format: pnpm format
+#   dev: pnpm dev --port $CONDUCTOR_PORT
+
+# --- Python (uv + ruff + pytest) — runner: orca ---
+# commands:
+#   install: uv sync --frozen
+#   precommit: uv run ruff check . && uv run ruff format --check . && uv run mypy .
+#   test: uv run pytest -q
+#   test_file: uv run pytest -q {file}
+#   format: uv run ruff format . && uv run ruff check --fix .
+#   dev: uv run uvicorn app.main:app --reload --port ${PORT:-8000}
+
+# --- Python (poetry) ---
+# commands:
+#   install: poetry install --sync
+#   precommit: poetry run ruff check . && poetry run mypy .
+#   test: poetry run pytest -q
+#   test_file: poetry run pytest -q {file}
+#   format: poetry run ruff format .
+
+# --- Elixir / Phoenix ---
+# commands:
+#   install: mix deps.get
+#   precommit: mix precommit
+#   test: mix test
+#   test_file: mix test {file}
+#   format: mix format
