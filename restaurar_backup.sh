@@ -1294,6 +1294,12 @@ Uso:
                                     # restaura o snapshot completo p/ staging,
                                     # sem prompt (uso: HUB via hub-restore-shell)
 
+O script carrega /etc/restic/env (o mesmo do backup), abre o repositório no
+S3 e oferece um menu para restaurar arquivos, sites e bancos de dados de
+qualquer snapshot. Por padrão tudo é restaurado em um diretório de staging
+(/tmp/restauracao-<data>); sobrescrever produção ou importar banco exige
+confirmação digitada (SOBRESCREVER / IMPORTAR) e oferece backup preventivo.
+
 Variáveis opcionais (defina antes de rodar, se precisar):
   RESTIC_ENV_FILE=/outro/env       env alternativo (padrão /etc/restic/env)
   RESTORE_STAGING_BASE=/dir/base   base do staging (padrão /tmp/restauracao)
