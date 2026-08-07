@@ -28,6 +28,11 @@
 #   sudo bash instalar_backup.sh --hub-pubkey "ssh-ed25519 AAAA... hub"
 #                                                 # instala/atualiza a chave do HUB
 #                                                 # em ~hubrestore/.ssh/authorized_keys
+#
+# Sem --hub-pubkey o usuário hubrestore e o sudoers.d ainda são provisionados
+# normalmente (privilégio mínimo já pronto); só o authorized_keys fica
+# pendente. Rode de novo com --hub-pubkey quando tiver a chave do HUB — é
+# seguro repetir a instalação inteira a qualquer momento (idempotente).
 # =============================================================================
 
 set -euo pipefail
@@ -465,7 +470,7 @@ provision_hubrestore_user() {
     if [[ ! -x "${HUB_SHELL_DEST}" ]]; then
         log_error "${HUB_SHELL_DEST} ausente ou não executável — pulando todo o provisionamento de ${HUBRESTORE_USER}."
         log_error "Rode de novo (o instalador tenta baixar o wrapper de novo automaticamente)."
-        return 0
+        return 1
     fi
 
     # Shell precisa ser um shell de verdade: o sshd invoca
@@ -487,9 +492,12 @@ provision_hubrestore_user() {
         log_info "Usuário ${HUBRESTORE_USER} criado (sem senha, home ${HUBRESTORE_HOME})."
     fi
 
-    # sudoers.d — única elevação permitida: rodar o restore não-interativo como root.
+    # sudoers.d — única elevação permitida: rodar o restore não-interativo como
+    # root. Arquivo dedicado a este instalador: compara o CONTEÚDO INTEIRO
+    # (não apenas se a linha existe) para garantir que reexecução convirja
+    # para exatamente uma regra, mesmo se o arquivo tiver sido editado à mão.
     local sudoers_line="${HUBRESTORE_USER} ALL=(root) NOPASSWD: ${RESTORE_DEST} *"
-    if [[ -f "${HUBRESTORE_SUDOERS}" ]] && grep -qxF "${sudoers_line}" "${HUBRESTORE_SUDOERS}"; then
+    if [[ -f "${HUBRESTORE_SUDOERS}" ]] && [[ "$(cat -- "${HUBRESTORE_SUDOERS}")" == "${sudoers_line}" ]]; then
         log_info "${HUBRESTORE_SUDOERS} já correto. Pulando."
     else
         local tmp_sudoers
@@ -535,8 +543,11 @@ provision_hubrestore_user() {
     fi
     rm -f "${key_check_file}"
 
+    # Compara o CONTEÚDO INTEIRO do arquivo (não apenas se a linha existe):
+    # authorized_keys do hubrestore é dedicado a este instalador e deve conter
+    # exatamente uma chave; reexecução converge reescrevendo se divergir.
     local key_line="command=\"${HUB_SHELL_DEST}\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ${HUB_PUBKEY}"
-    if [[ -f "${auth_keys}" ]] && grep -qxF "${key_line}" "${auth_keys}"; then
+    if [[ -f "${auth_keys}" ]] && [[ "$(cat -- "${auth_keys}")" == "${key_line}" ]]; then
         log_info "Chave do HUB já presente em ${auth_keys}. Pulando."
     else
         printf '%s\n' "${key_line}" > "${auth_keys}"
@@ -592,7 +603,8 @@ main() {
     configure_cron
     apply_lifecycle
     run_first_backup
-    provision_hubrestore_user
+    provision_hubrestore_user \
+        || die "Provisionamento de ${HUBRESTORE_USER} falhou (wrapper hub-restore-shell não instalado)."
     print_final
 }
 

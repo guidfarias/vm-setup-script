@@ -41,6 +41,10 @@ reject() {
 cmd="${SSH_ORIGINAL_COMMAND:-}"
 [[ -n "${cmd}" ]] || reject "sessão sem comando (shell vazio/interativo)"
 
+# read -a só enxerga a 1ª linha — sem este check "status job<newline>lixo"
+# passaria despercebido em vez de ser recusado.
+[[ "${cmd}" == *$'\n'* ]] && reject "comando multi-linha: ${cmd}"
+
 # Split simples: exatamente "ação arg1 [arg2]" — sem pipes, ;, &&, etc.
 read -r -a parts <<< "${cmd}"
 action="${parts[0]:-}"
