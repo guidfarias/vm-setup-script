@@ -85,6 +85,10 @@ RESTORE_STAGING_BASE="${RESTORE_STAGING_BASE:-/tmp/restauracao}"
 # Limite de itens exibidos por diretório na navegação (diretórios gigantes).
 RESTORE_LS_LIMIT="${RESTORE_LS_LIMIT:-300}"
 
+# Modo não-interativo (disparado pelo HUB via hub-restore-shell).
+HUB_JOB_LOG_DIR="${HUB_JOB_LOG_DIR:-/var/log/hub-restore}"
+HUB_JOB_STATUS_DIR="${HUB_JOB_STATUS_DIR:-/var/lib/hub-restore}"
+
 # ---------------------------------------------------------------------------
 # ESTADO INTERNO / LIMPEZA
 # ---------------------------------------------------------------------------
@@ -1184,6 +1188,91 @@ main_menu() {
 }
 
 # ---------------------------------------------------------------------------
+# MODO NÃO-INTERATIVO (HUB)
+# ---------------------------------------------------------------------------
+# Acionado via: restic-restore.sh --non-interactive --snapshot <id> --job <job_id>
+# Sem prompt algum; restaura o snapshot INTEIRO para o staging padrão.
+# Log em ${HUB_JOB_LOG_DIR}/<job_id>.log; status em ${HUB_JOB_STATUS_DIR}/<job_id>.status.
+
+valid_job_id() {
+    [[ "$1" =~ ^[A-Za-z0-9-]{1,64}$ ]]
+}
+
+valid_snapshot_id() {
+    [[ "$1" == "latest" || "$1" =~ ^[0-9a-f]{8,64}$ ]]
+}
+
+hub_job_log_file()    { echo "${HUB_JOB_LOG_DIR}/${1}.log"; }
+hub_job_status_file() { echo "${HUB_JOB_STATUS_DIR}/${1}.status"; }
+
+# write_job_status <job_id> <linha> — grava atomicamente (mv sobre o mesmo fs).
+write_job_status() {
+    local job_id="$1" line="$2" status_file tmp
+    status_file="$(hub_job_status_file "${job_id}")"
+    tmp="$(mktemp "${HUB_JOB_STATUS_DIR}/.${job_id}.XXXXXX")"
+    printf '%s\n' "${line}" > "${tmp}"
+    chmod 644 "${tmp}"
+    mv -f "${tmp}" "${status_file}"
+}
+
+# Fluxo completo do modo não-interativo. Nunca propaga erro pro shell do
+# chamador: qualquer falha vira "failed <resumo>" no arquivo de status.
+run_non_interactive() {
+    local snap="$1" job_id="$2"
+
+    mkdir -p "${HUB_JOB_LOG_DIR}" "${HUB_JOB_STATUS_DIR}" \
+        || die "Não foi possível criar ${HUB_JOB_LOG_DIR}/${HUB_JOB_STATUS_DIR}."
+    chmod 750 "${HUB_JOB_LOG_DIR}" "${HUB_JOB_STATUS_DIR}" 2>/dev/null || true
+
+    valid_job_id "${job_id}"  || die "job_id inválido: ${job_id}"
+    valid_snapshot_id "${snap}" || die "snapshot inválido: ${snap}"
+
+    RESTORE_LOG_FILE="$(hub_job_log_file "${job_id}")"
+    : > "${RESTORE_LOG_FILE}" 2>/dev/null || true
+    chmod 640 "${RESTORE_LOG_FILE}" 2>/dev/null || true
+
+    write_job_status "${job_id}" "running"
+    info "Job ${job_id}: restauração não-interativa do snapshot ${snap} iniciada."
+
+    require_root
+    if ! load_env_file 2>>"${RESTORE_LOG_FILE}"; then
+        write_job_status "${job_id}" "failed env: ${RESTIC_ENV_FILE} indisponível/inválido"
+        exit 1
+    fi
+    if ! validate_env 2>>"${RESTORE_LOG_FILE}"; then
+        write_job_status "${job_id}" "failed variáveis obrigatórias ausentes em ${RESTIC_ENV_FILE}"
+        exit 1
+    fi
+    export_restic_env
+
+    if ! check_repo 2>>"${RESTORE_LOG_FILE}"; then
+        write_job_status "${job_id}" "failed não foi possível abrir o repositório restic"
+        exit 1
+    fi
+
+    if ! restic snapshots "${snap}" >/dev/null 2>>"${RESTORE_LOG_FILE}"; then
+        write_job_status "${job_id}" "failed snapshot ${snap} não encontrado"
+        exit 1
+    fi
+
+    ensure_staging
+    if ! check_free_space "${STAGING_DIR}" 2>>"${RESTORE_LOG_FILE}"; then
+        write_job_status "${job_id}" "failed espaço livre insuficiente no staging"
+        exit 1
+    fi
+
+    step "Job ${job_id}: restaurando snapshot ${snap} (completo) → ${STAGING_DIR}"
+    if run_restore "${snap}" "/" "${STAGING_DIR}"; then
+        info "Job ${job_id}: restauração concluída em ${STAGING_DIR}."
+        write_job_status "${job_id}" "success ${STAGING_DIR}"
+    else
+        error "Job ${job_id}: restauração falhou. Veja ${RESTORE_LOG_FILE}."
+        write_job_status "${job_id}" "failed restic restore retornou erro — veja ${RESTORE_LOG_FILE}"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -1194,30 +1283,45 @@ restic-restore.sh — restauração interativa dos backups restic (CIPNET)
 Uso:
   sudo restic-restore.sh           # abre o menu interativo
   sudo restic-restore.sh --help
-
-O script carrega /etc/restic/env (o mesmo do backup), abre o repositório no
-S3 e oferece um menu para restaurar arquivos, sites e bancos de dados de
-qualquer snapshot. Por padrão tudo é restaurado em um diretório de staging
-(/tmp/restauracao-<data>); sobrescrever produção ou importar banco exige
-confirmação digitada (SOBRESCREVER / IMPORTAR) e oferece backup preventivo.
+  sudo restic-restore.sh --non-interactive --snapshot <id> --job <job_id>
+                                    # restaura o snapshot completo p/ staging,
+                                    # sem prompt (uso: HUB via hub-restore-shell)
 
 Variáveis opcionais (defina antes de rodar, se precisar):
   RESTIC_ENV_FILE=/outro/env       env alternativo (padrão /etc/restic/env)
   RESTORE_STAGING_BASE=/dir/base   base do staging (padrão /tmp/restauracao)
   RESTORE_LOG_FILE=/arquivo.log    log (padrão /var/log/restic-restore.log)
+  HUB_JOB_LOG_DIR=/dir             log dos jobs do HUB (padrão /var/log/hub-restore)
+  HUB_JOB_STATUS_DIR=/dir          status dos jobs do HUB (padrão /var/lib/hub-restore)
 HELP
 }
 
 main() {
-    for arg in "$@"; do
-        case "${arg}" in
+    local non_interactive=false snap_arg="" job_arg=""
+
+    while (( $# > 0 )); do
+        case "$1" in
             --help|-h) show_help; exit 0 ;;
-            *) echo "Argumento desconhecido: ${arg}" >&2; exit 1 ;;
+            --non-interactive) non_interactive=true; shift ;;
+            --snapshot)
+                [[ $# -ge 2 ]] || { echo "--snapshot exige um valor" >&2; exit 1; }
+                snap_arg="$2"; shift 2 ;;
+            --job)
+                [[ $# -ge 2 ]] || { echo "--job exige um valor" >&2; exit 1; }
+                job_arg="$2"; shift 2 ;;
+            *) echo "Argumento desconhecido: $1" >&2; exit 1 ;;
         esac
     done
 
     # Evita avisos de cwd ao rodar comandos como o usuário postgres via sudo.
     cd / || true
+
+    if [[ "${non_interactive}" == "true" ]]; then
+        [[ -n "${snap_arg}" ]] || { echo "--non-interactive exige --snapshot <id>" >&2; exit 1; }
+        [[ -n "${job_arg}" ]]  || { echo "--non-interactive exige --job <job_id>" >&2; exit 1; }
+        run_non_interactive "${snap_arg}" "${job_arg}"
+        return
+    fi
 
     require_root
     load_env_file
