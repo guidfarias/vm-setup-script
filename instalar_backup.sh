@@ -9,12 +9,13 @@
 #      não mexe em nada se o cliente já existir (caso do RunCloud).
 #   2. Instala AWS CLI v2 (instalador oficial)
 #   3. Instala restic ${RESTIC_VERSION} (versão fixada e testada)
-#   4. Baixa o restic-backup.sh, o wrapper 'rr' e o restic-restore.sh
-#      (restauração interativa) para /usr/local/bin/
+#   4. Baixa o restic-backup.sh, o wrapper 'rr', o restic-restore.sh
+#      (restauração interativa) e o hub-restore-shell para /usr/local/bin/
 #   5. Cria /etc/restic/env a partir de template (NÃO sobrescreve se já existir)
 #   6. Configura o cron em /etc/cron.d/restic-backup
 #   7. (Opcional) Aplica a S3 Lifecycle Rule que expira os .tar.gz
 #   8. (Opcional) Roda o primeiro backup de teste
+#   9. Provisiona o usuário 'hubrestore' (restauração remota via HUB, --hub-pubkey)
 #
 # É IDEMPOTENTE: pode rodar de novo com segurança. Passos já concluídos são
 # detectados e pulados; o /etc/restic/env existente NUNCA é sobrescrito.
@@ -24,6 +25,14 @@
 #   sudo bash instalar_backup.sh --no-lifecycle  # não aplica a regra de S3
 #   sudo bash instalar_backup.sh --run-now       # roda 1º backup sem perguntar
 #   sudo bash instalar_backup.sh --skip-run      # não roda o 1º backup
+#   sudo bash instalar_backup.sh --hub-pubkey "ssh-ed25519 AAAA... hub"
+#                                                 # instala/atualiza a chave do HUB
+#                                                 # em ~hubrestore/.ssh/authorized_keys
+#
+# Sem --hub-pubkey o usuário hubrestore e o sudoers.d ainda são provisionados
+# normalmente (privilégio mínimo já pronto); só o authorized_keys fica
+# pendente. Rode de novo com --hub-pubkey quando tiver a chave do HUB — é
+# seguro repetir a instalação inteira a qualquer momento (idempotente).
 # =============================================================================
 
 set -euo pipefail
@@ -36,10 +45,12 @@ RESTIC_VERSION="0.17.3"
 GITHUB_RAW="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/configura_backup.sh"
 GITHUB_RAW_RR="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/rr.sh"
 GITHUB_RAW_RESTORE="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/restaurar_backup.sh"
+GITHUB_RAW_HUB_SHELL="https://raw.githubusercontent.com/guidfarias/vm-setup-script/master/hub-restore-shell"
 
 SCRIPT_DEST="/usr/local/bin/restic-backup.sh"
 RR_DEST="/usr/local/bin/rr"
 RESTORE_DEST="/usr/local/bin/restic-restore.sh"
+HUB_SHELL_DEST="/usr/local/bin/hub-restore-shell"
 ENV_DIR="/etc/restic"
 ENV_FILE="${ENV_DIR}/env"
 CRON_FILE="/etc/cron.d/restic-backup"
@@ -53,6 +64,12 @@ LIFECYCLE_DAYS="30"
 
 APPLY_LIFECYCLE=true
 RUN_FIRST_BACKUP="ask"   # ask | yes | no
+
+# Usuário de restauração remota do HUB (issue #3).
+HUBRESTORE_USER="hubrestore"
+HUBRESTORE_HOME="/home/${HUBRESTORE_USER}"
+HUBRESTORE_SUDOERS="/etc/sudoers.d/hubrestore"
+HUB_PUBKEY=""
 
 # ---------------------------------------------------------------------------
 # CORES / LOG
@@ -70,16 +87,21 @@ die() { log_error "$1"; exit 1; }
 # ARGUMENTOS
 # ---------------------------------------------------------------------------
 
-for arg in "$@"; do
-    case "${arg}" in
-        --no-lifecycle) APPLY_LIFECYCLE=false ;;
-        --run-now)      RUN_FIRST_BACKUP="yes" ;;
-        --skip-run)     RUN_FIRST_BACKUP="no" ;;
+while (( $# > 0 )); do
+    case "$1" in
+        --no-lifecycle) APPLY_LIFECYCLE=false; shift ;;
+        --run-now)      RUN_FIRST_BACKUP="yes"; shift ;;
+        --skip-run)     RUN_FIRST_BACKUP="no"; shift ;;
+        --hub-pubkey)
+            [[ $# -ge 2 ]] || die "--hub-pubkey exige um valor (a chave pública SSH entre aspas)."
+            HUB_PUBKEY="$2"; shift 2 ;;
+        --hub-pubkey=*)
+            HUB_PUBKEY="${1#--hub-pubkey=}"; shift ;;
         --help|-h)
             grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -40
             exit 0
             ;;
-        *) die "Argumento desconhecido: ${arg}" ;;
+        *) die "Argumento desconhecido: $1" ;;
     esac
 done
 
@@ -258,6 +280,22 @@ install_backup_script() {
         log_warn "Não foi possível instalar o restic-restore.sh (não crítico)."
         rm -f "${RESTORE_DEST}"
     fi
+
+    # Wrapper forced-command do usuário hubrestore (restauração remota via HUB).
+    # Baixa para um temporário NO MESMO DIRETÓRIO do destino (garante que o
+    # mv final seja atômico — rename, não copy+delete) e só substitui em
+    # caso de sucesso: uma falha de rede numa reexecução não pode apagar um
+    # wrapper funcional.
+    local hub_shell_tmp
+    hub_shell_tmp="$(mktemp "$(dirname "${HUB_SHELL_DEST}")/.hub-restore-shell.XXXXXX")"
+    if curl -fsSL "${GITHUB_RAW_HUB_SHELL}" -o "${hub_shell_tmp}" && bash -n "${hub_shell_tmp}"; then
+        chmod 755 "${hub_shell_tmp}"
+        mv -f "${hub_shell_tmp}" "${HUB_SHELL_DEST}"
+        log_info "Wrapper hub-restore-shell instalado em ${HUB_SHELL_DEST}."
+    else
+        log_warn "Não foi possível baixar o hub-restore-shell (não crítico; mantendo versão existente, se houver)."
+        rm -f "${hub_shell_tmp}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -417,6 +455,109 @@ run_first_backup() {
 }
 
 # ---------------------------------------------------------------------------
+# 9. USUÁRIO hubrestore (restauração remota via HUB — issue #3)
+# ---------------------------------------------------------------------------
+# Idempotente: cada passo checa o estado atual antes de agir. Sem --hub-pubkey
+# o usuário/sudoers são provisionados mesmo assim (privilégio mínimo pronto);
+# só o authorized_keys fica pendente até a chave ser informada.
+
+provision_hubrestore_user() {
+    log_step "9/9 — Provisionando usuário ${HUBRESTORE_USER} (restauração remota HUB)"
+
+    # Sem o wrapper instalado, sudoers/authorized_keys apontariam para um
+    # binário inexistente — melhor não provisionar nada do que provisionar
+    # acesso quebrado.
+    if [[ ! -x "${HUB_SHELL_DEST}" ]]; then
+        log_error "${HUB_SHELL_DEST} ausente ou não executável — pulando todo o provisionamento de ${HUBRESTORE_USER}."
+        log_error "Rode de novo (o instalador tenta baixar o wrapper de novo automaticamente)."
+        return 1
+    fi
+
+    # Shell precisa ser um shell de verdade: o sshd invoca
+    # "<shell> -c '<forced-command>'" para rodar o command= do
+    # authorized_keys. Com nologin o wrapper nunca executa. A restrição
+    # de acesso vem do command= + sudoers, não do shell da conta.
+    if id -u "${HUBRESTORE_USER}" &>/dev/null; then
+        log_info "Usuário ${HUBRESTORE_USER} já existe. Pulando criação."
+        if [[ "$(getent passwd "${HUBRESTORE_USER}" | cut -d: -f7)" != "/bin/bash" ]]; then
+            chsh -s /bin/bash "${HUBRESTORE_USER}" \
+                || die "Falha ao ajustar o shell de ${HUBRESTORE_USER} para /bin/bash."
+            log_info "Shell de ${HUBRESTORE_USER} corrigido para /bin/bash."
+        fi
+    else
+        useradd --system --create-home --home-dir "${HUBRESTORE_HOME}" \
+            --shell /bin/bash "${HUBRESTORE_USER}" \
+            || die "Falha ao criar o usuário ${HUBRESTORE_USER}."
+        passwd -l "${HUBRESTORE_USER}" &>/dev/null || true
+        log_info "Usuário ${HUBRESTORE_USER} criado (sem senha, home ${HUBRESTORE_HOME})."
+    fi
+
+    # sudoers.d — única elevação permitida: rodar o restore não-interativo como
+    # root. Arquivo dedicado a este instalador: compara o CONTEÚDO INTEIRO
+    # (não apenas se a linha existe) para garantir que reexecução convirja
+    # para exatamente uma regra, mesmo se o arquivo tiver sido editado à mão.
+    local sudoers_line="${HUBRESTORE_USER} ALL=(root) NOPASSWD: ${RESTORE_DEST} *"
+    if [[ -f "${HUBRESTORE_SUDOERS}" ]] && [[ "$(cat -- "${HUBRESTORE_SUDOERS}")" == "${sudoers_line}" ]]; then
+        log_info "${HUBRESTORE_SUDOERS} já correto. Pulando."
+    else
+        local tmp_sudoers
+        tmp_sudoers="$(mktemp)"
+        echo "${sudoers_line}" > "${tmp_sudoers}"
+        if visudo -cf "${tmp_sudoers}" &>/dev/null; then
+            install -m 440 -o root -g root "${tmp_sudoers}" "${HUBRESTORE_SUDOERS}"
+            log_info "${HUBRESTORE_SUDOERS} configurado: ${sudoers_line}"
+        else
+            log_error "Regra sudoers gerada é inválida — abortando escrita em ${HUBRESTORE_SUDOERS}."
+        fi
+        rm -f "${tmp_sudoers}"
+    fi
+
+    # ~/.ssh/authorized_keys — só a chave do HUB, com opções que restringem a
+    # sessão ao wrapper forced-command (sem PTY, sem forwarding).
+    local ssh_dir="${HUBRESTORE_HOME}/.ssh"
+    local auth_keys="${ssh_dir}/authorized_keys"
+    mkdir -p "${ssh_dir}"
+    chmod 700 "${ssh_dir}"
+    chown "${HUBRESTORE_USER}:${HUBRESTORE_USER}" "${ssh_dir}"
+
+    if [[ -z "${HUB_PUBKEY}" ]]; then
+        log_warn "Nenhuma chave informada (--hub-pubkey). ${auth_keys} não foi alterado."
+        log_warn "Rode de novo com:  sudo bash $0 --hub-pubkey \"ssh-ed25519 AAAA... hub\""
+        return 0
+    fi
+
+    # Valida que é EXATAMENTE UMA chave pública SSH antes de gravar no
+    # authorized_keys. Entrada multi-linha com uma chave válida na 1ª linha
+    # passaria despercebida no ssh-keygen -l e gravaria uma 2ª chave SEM as
+    # opções de forced-command — buraco de segurança.
+    if [[ "${HUB_PUBKEY}" == *$'\n'* ]]; then
+        die "--hub-pubkey deve ser uma única linha (uma única chave). Valor recebido tem quebra de linha."
+    fi
+    local key_check_file key_count
+    key_check_file="$(mktemp)"
+    printf '%s\n' "${HUB_PUBKEY}" > "${key_check_file}"
+    key_count="$(ssh-keygen -l -f "${key_check_file}" 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${key_count}" != "1" ]]; then
+        rm -f "${key_check_file}"
+        die "--hub-pubkey não é uma única chave pública SSH válida: ${HUB_PUBKEY}"
+    fi
+    rm -f "${key_check_file}"
+
+    # Compara o CONTEÚDO INTEIRO do arquivo (não apenas se a linha existe):
+    # authorized_keys do hubrestore é dedicado a este instalador e deve conter
+    # exatamente uma chave; reexecução converge reescrevendo se divergir.
+    local key_line="command=\"${HUB_SHELL_DEST}\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ${HUB_PUBKEY}"
+    if [[ -f "${auth_keys}" ]] && [[ "$(cat -- "${auth_keys}")" == "${key_line}" ]]; then
+        log_info "Chave do HUB já presente em ${auth_keys}. Pulando."
+    else
+        printf '%s\n' "${key_line}" > "${auth_keys}"
+        chmod 600 "${auth_keys}"
+        chown "${HUBRESTORE_USER}:${HUBRESTORE_USER}" "${auth_keys}"
+        log_info "Chave do HUB instalada em ${auth_keys} (forced-command: ${HUB_SHELL_DEST})."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # RESUMO FINAL
 # ---------------------------------------------------------------------------
 
@@ -462,6 +603,8 @@ main() {
     configure_cron
     apply_lifecycle
     run_first_backup
+    provision_hubrestore_user \
+        || die "Provisionamento de ${HUBRESTORE_USER} falhou (wrapper hub-restore-shell não instalado)."
     print_final
 }
 

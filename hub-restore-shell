@@ -1,0 +1,82 @@
+#!/bin/bash
+# =============================================================================
+# hub-restore-shell — forced-command do usuário 'hubrestore' (SSH)
+# RunCloud / CIPNET
+#
+# Configurado como "command=" no authorized_keys do usuário hubrestore
+# (ver instalar_backup.sh). Toda sessão SSH desse usuário roda ESTE script
+# em vez de um shell; o comando digitado pelo cliente chega em
+# SSH_ORIGINAL_COMMAND. Só os 3 comandos abaixo são aceitos:
+#
+#   restore <snapshot_id> <job_id>   → sudo restic-restore.sh --non-interactive ...
+#   status  <job_id>                 → imprime /var/lib/hub-restore/<job_id>.status
+#   log     <job_id>                 → imprime /var/log/hub-restore/<job_id>.log
+#
+# Qualquer outra coisa (inclusive sessão vazia/interativa, comandos fora da
+# whitelist, ou snapshot_id/job_id fora do formato esperado) é recusada com
+# exit != 0 e registrada no syslog.
+# =============================================================================
+
+set -uo pipefail
+
+# Caminhos fixos de propósito — wrapper de segurança não deve aceitar
+# overrides por ambiente (isso ampliaria a superfície de ataque via SSH).
+readonly RESTORE_BIN="/usr/local/bin/restic-restore.sh"
+readonly HUB_JOB_LOG_DIR="/var/log/hub-restore"
+readonly HUB_JOB_STATUS_DIR="/var/lib/hub-restore"
+
+SNAPSHOT_RE='^[0-9a-f]{8,64}$'
+JOB_RE='^[A-Za-z0-9-]{1,64}$'
+
+log_attempt() {
+    logger -t hub-restore-shell -- "$*" 2>/dev/null || true
+}
+
+reject() {
+    log_attempt "recusado (usuário=$(id -un 2>/dev/null)): $*"
+    echo "hub-restore-shell: comando recusado." >&2
+    exit 1
+}
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+[[ -n "${cmd}" ]] || reject "sessão sem comando (shell vazio/interativo)"
+
+# read -a só enxerga a 1ª linha — sem este check "status job<newline>lixo"
+# passaria despercebido em vez de ser recusado.
+[[ "${cmd}" == *$'\n'* ]] && reject "comando multi-linha: ${cmd}"
+
+# Split simples: exatamente "ação arg1 [arg2]" — sem pipes, ;, &&, etc.
+read -r -a parts <<< "${cmd}"
+action="${parts[0]:-}"
+
+case "${action}" in
+    restore)
+        (( ${#parts[@]} == 3 )) || reject "uso: restore <snapshot_id> <job_id> — recebido: ${cmd}"
+        snap="${parts[1]}"; job="${parts[2]}"
+        [[ "${snap}" =~ ${SNAPSHOT_RE} ]] || reject "snapshot_id inválido: ${snap}"
+        [[ "${job}" =~ ${JOB_RE} ]]       || reject "job_id inválido: ${job}"
+        log_attempt "restore snapshot=${snap} job=${job}"
+        exec sudo -n "${RESTORE_BIN}" --non-interactive --snapshot "${snap}" --job "${job}"
+        ;;
+    status)
+        (( ${#parts[@]} == 2 )) || reject "uso: status <job_id> — recebido: ${cmd}"
+        job="${parts[1]}"
+        [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
+        status_file="${HUB_JOB_STATUS_DIR}/${job}.status"
+        [[ -f "${status_file}" ]] || reject "status inexistente para job ${job}"
+        log_attempt "status job=${job}"
+        cat -- "${status_file}"
+        ;;
+    log)
+        (( ${#parts[@]} == 2 )) || reject "uso: log <job_id> — recebido: ${cmd}"
+        job="${parts[1]}"
+        [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
+        log_file="${HUB_JOB_LOG_DIR}/${job}.log"
+        [[ -f "${log_file}" ]] || reject "log inexistente para job ${job}"
+        log_attempt "log job=${job}"
+        cat -- "${log_file}"
+        ;;
+    *)
+        reject "comando fora da whitelist: ${cmd}"
+        ;;
+esac
