@@ -97,6 +97,13 @@ readonly HUB_TOKEN_KEY_FILE="/etc/restic/hub-token.key"
 readonly HUB_JOB_LOG_DIR="/var/log/hub-restore"
 readonly HUB_JOB_STATUS_DIR="/var/lib/hub-restore"
 
+# Restauração seletiva (issue #9): staging isolado por job, expirável em 24h.
+# Caminhos fixos pelo mesmo motivo dos de cima.
+readonly HUB_ITEM_STAGING_DIR="/var/lib/hub-restore/items"
+readonly HUB_ITEM_LOCK_FILE="/var/lib/hub-restore/.job.lock"
+readonly HUB_ITEM_TTL_SECONDS=86400
+JOB_ID_RE='^[A-Za-z0-9-]{1,64}$'
+
 # ---------------------------------------------------------------------------
 # ESTADO INTERNO / LIMPEZA
 # ---------------------------------------------------------------------------
@@ -268,6 +275,52 @@ check_repo() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# VARIANTES "SAFE" (sem die) — usadas pelo fluxo hub, onde uma falha precisa
+# virar "failed <motivo>" auditável no meta.json/job.log, nunca matar o
+# processo antes do handler rodar. die() faz exit direto: um `if ! fn` em
+# torno da versão "die" nunca vê o erro, porque o processo já morreu dentro
+# dela — por isso load_env_file/validate_env/check_repo têm cópias aqui que
+# só retornam 1.
+# ---------------------------------------------------------------------------
+
+load_env_file_safe() {
+    [[ -f "${RESTIC_ENV_FILE}" ]] || { error "Arquivo ${RESTIC_ENV_FILE} não encontrado."; return 1; }
+    local perms
+    perms="$(stat -c '%a' "${RESTIC_ENV_FILE}" 2>/dev/null \
+             || stat -f '%Lp' "${RESTIC_ENV_FILE}" 2>/dev/null \
+             || echo '???')"
+    if [[ "${perms}" != "???" && "${perms}" != "600" && "${perms}" != "400" ]]; then
+        error "Permissões inseguras em ${RESTIC_ENV_FILE} (${perms})."
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    source "${RESTIC_ENV_FILE}" || { error "Falha ao carregar ${RESTIC_ENV_FILE}."; return 1; }
+    info "Variáveis carregadas de ${RESTIC_ENV_FILE} (perms ${perms})."
+}
+
+validate_env_safe() {
+    command -v restic &>/dev/null || { error "'restic' não encontrado."; return 1; }
+    command -v openssl &>/dev/null || { error "'openssl' não encontrado."; return 1; }
+    perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+        || { error "Módulos Perl necessários não estão disponíveis."; return 1; }
+    [[ -n "${AWS_ACCESS_KEY_ID}" ]]     || { error "AWS_ACCESS_KEY_ID não definido no env."; return 1; }
+    [[ -n "${AWS_SECRET_ACCESS_KEY}" ]] || { error "AWS_SECRET_ACCESS_KEY não definido no env."; return 1; }
+    [[ -n "${RESTIC_PASSWORD}" ]]       || { error "RESTIC_PASSWORD não definido no env."; return 1; }
+    [[ -n "${S3_BUCKET}" ]]             || { error "S3_BUCKET não definido no env."; return 1; }
+    # MIN_FREE_MB entra em aritmética (( )) sob set -u mais adiante — um valor
+    # não numérico no env quebraria o script no meio do fluxo hub em vez de
+    # falhar aqui, cedo e com mensagem clara.
+    [[ "${MIN_FREE_MB}" =~ ^[0-9]+$ ]] || { error "MIN_FREE_MB inválido no env: '${MIN_FREE_MB}'."; return 1; }
+    return 0
+}
+
+check_repo_safe() {
+    info "Abrindo repositório: ${RESTIC_REPOSITORY}"
+    restic cat config >/dev/null 2>>"${RESTORE_LOG_FILE}" \
+        || { error "Não foi possível abrir o repositório restic."; return 1; }
+}
+
 warn_if_backup_running() {
     command -v flock &>/dev/null || return 0
     [[ -e "${LOCK_FILE}" ]] || return 0
@@ -294,6 +347,28 @@ check_free_space() {
     if [[ -n "${free_mb}" ]] && (( free_mb < MIN_FREE_MB )); then
         warn "Pouco espaço livre em ${target}: ${free_mb}MB (< ${MIN_FREE_MB}MB)."
         ask_yes_no "Continuar mesmo assim?" "n" || return 1
+    fi
+    return 0
+}
+
+# Variante fail-closed para o fluxo hub (sem terminal, sem prompt possível):
+# df falhando ou saída vazia é tratado como falha, nunca como "sem info,
+# segue"; o mínimo exigido é o maior entre MIN_FREE_MB e o tamanho do item
+# (se conhecido), para não aceitar espaço que baste pro MIN_FREE_MB mas não
+# caiba o item de fato.
+check_free_space_fail_closed() {
+    local target="$1" item_size_bytes="${2:-0}" free_mb threshold_mb item_mb
+    free_mb="$(df -Pm "${target}" 2>/dev/null | awk 'NR==2 {print $4}')"
+    [[ "${free_mb}" =~ ^[0-9]+$ ]] || { warn "Não foi possível medir espaço livre em ${target}."; return 1; }
+    [[ "${MIN_FREE_MB}" =~ ^[0-9]+$ ]] || { warn "MIN_FREE_MB inválido: '${MIN_FREE_MB}'."; return 1; }
+    threshold_mb="${MIN_FREE_MB}"
+    if [[ "${item_size_bytes}" =~ ^[0-9]+$ ]] && (( item_size_bytes > 0 )); then
+        item_mb=$(((item_size_bytes + 1048575) / 1048576))
+        (( item_mb > threshold_mb )) && threshold_mb="${item_mb}"
+    fi
+    if (( free_mb < threshold_mb )); then
+        warn "Pouco espaço livre em ${target}: ${free_mb}MB (< ${threshold_mb}MB necessários)."
+        return 1
     fi
     return 0
 }
@@ -360,7 +435,15 @@ restic_ls_records() {
 decode_restic_path() {
     local encoded="$1" padded="${1//-/+}"
     [[ "${encoded}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
-    padded="${padded//_/\/}"
+    # BUG CORRIGIDO: "${padded//_/\/}" produz "\/" literal (barra invertida +
+    # barra), não "/" — o \ dentro do padrão de substituição bash não é
+    # tratado como escape aqui. Isso quebrava a decodificação de qualquer
+    # path cujo base64url contivesse '_' (comum; sem relação com o nome ter
+    # caracteres especiais). A forma correta usa uma variável para o valor
+    # de substituição, evitando ambiguidade com o delimitador "/" do próprio
+    # operador de substituição.
+    local slash='/'
+    padded="${padded//_/${slash}}"
     case $(( ${#padded} % 4 )) in
         0) ;;
         2) padded+="==" ;;
@@ -472,6 +555,19 @@ count_path_components() {
     printf '%s' "${p}" | awk -F/ '{print NF}'
 }
 
+# Escapa * ? [ ] para o --include do Restic tratar o caminho como literal,
+# não como padrão de glob. Sem isso, um item cujo nome real contenha esses
+# caracteres pode casar (e restaurar) outros itens do snapshot.
+escape_restic_include_pattern() {
+    local p="$1"
+    p="${p//\\/\\\\}"
+    p="${p//\*/\\*}"
+    p="${p//\?/\\?}"
+    p="${p//\[/\\[}"
+    p="${p//\]/\\]}"
+    printf '%s' "${p}"
+}
+
 # restic restore com saída na tela E no log.
 run_restore() {
     local snap="$1" path="$2" target="$3"; shift 3
@@ -479,6 +575,16 @@ run_restore() {
     restic restore "${snap}" --target "${target}" --include "${path}" "$@" \
         2>&1 | tee -a "${RESTORE_LOG_FILE}"
     return "${PIPESTATUS[0]}"
+}
+
+# Mesmo restic restore, mas o caminho é tratado como literal (glob escapado).
+# Usado no fluxo --hub-restore-item, onde path vem de um token autenticado
+# e precisa casar exatamente aquele item, nada mais.
+run_restore_exact() {
+    local snap="$1" path="$2" target="$3"; shift 3
+    local escaped
+    escaped="$(escape_restic_include_pattern "${path}")"
+    run_restore "${snap}" "${escaped}" "${target}" "$@"
 }
 
 # Prévia (dry-run). Se a versão do restic não suportar, apenas avisa.
@@ -1330,7 +1436,11 @@ hub_base64url_encode() {
 
 hub_base64url_decode() {
     local payload="$1" padded="${1//-/+}"
-    padded="${padded//_/\/}"
+    # Mesma correção de decode_restic_path: "\/" no padrão de substituição
+    # bash não vira "/", produz "\/" literal — quebrava tokens cujo payload
+    # base64url contivesse '_'.
+    local slash='/'
+    padded="${padded//_/${slash}}"
     case $(( ${#padded} % 4 )) in
         0) ;;
         2) padded+="==" ;;
@@ -1446,6 +1556,42 @@ hub_get_item() {
     [[ -n "${G_ITEM_TYPE}" && "${G_ITEM_SIZE}" =~ ^[0-9]+$ && ${#G_ITEM_SIZE} -le 18 ]]
 }
 
+# Restic reporta size=0 no próprio nó de um diretório (não soma filhos). Para
+# a checagem de espaço fazer sentido num diretório, somamos o size de todos
+# os arquivos descendentes — `restic ls --json <snap> <dir>` já lista a
+# árvore inteira recursivamente. Fail-closed: qualquer falha de leitura
+# retorna 1 (chamada deve tratar como "não sei o tamanho", não como "0").
+# Limite bem acima de qualquer backup real (~9.2 EB, o teto de um inteiro
+# assinado de 64 bits usado pelo bash em $(( ))) — existe só para que a
+# checagem de overflow abaixo tenha uma margem segura para operar antes de
+# `total + size` estourar o range e virar lixo silencioso (bash não detecta
+# overflow de aritmética).
+readonly HUB_DIR_SIZE_LIMIT=9000000000000000000
+
+hub_dir_total_size() {
+    local snap="$1" dir="$2" records t size encoded total=0
+    records="$(mktemp)" || return 1
+    if ! restic_ls_records "${snap}" "${dir}" >"${records}"; then
+        rm -f "${records}"
+        return 1
+    fi
+    while IFS=$'\t' read -r t size encoded; do
+        [[ "${t}" == "f" ]] || continue
+        [[ "${size}" =~ ^[0-9]+$ && "${#size}" -le 18 ]] || continue
+        # Checa ANTES de somar: total > limite - size prova que a soma
+        # estouraria o limite, sem nunca deixar `total + size` executar
+        # perto do teto do inteiro de 64 bits do bash.
+        if (( total > HUB_DIR_SIZE_LIMIT - size )); then
+            rm -f "${records}"
+            return 1
+        fi
+        total=$((total + size))
+    done < "${records}"
+    rm -f "${records}"
+    [[ "${total}" =~ ^[0-9]+$ && "${#total}" -le 18 ]] || return 1
+    G_ITEM_SIZE="${total}"
+}
+
 run_hub_list() {
     local snap="$1" token="${2:-}" dir="/" i path type name item_token
     local items="" count=0 truncated=false
@@ -1529,6 +1675,18 @@ run_hub_preflight() {
     if [[ "${actual}" != "${expected}" ]]; then
         hub_json_error "type_mismatch" "O tipo do item não corresponde ao esperado."
         return 1
+    fi
+
+    # G_ITEM_SIZE de um diretório vem 0 do Restic (o nó não soma filhos) —
+    # sem isso, a checagem de espaço abaixo cairia sempre no mínimo genérico
+    # (MIN_FREE_MB), aceitando "pronto" mesmo quando o conteúdo real do
+    # diretório não caiba no staging. Fail-closed: se não conseguir somar o
+    # tamanho real, reporta falha em vez de seguir com um valor errado.
+    if [[ "${actual}" == "directory" ]]; then
+        if ! hub_dir_total_size "${snap}" "${path}"; then
+            hub_json_error "size_check_failed" "Não foi possível calcular o tamanho do diretório."
+            return 1
+        fi
     fi
 
     # O preflight é read-only: usa o ancestral existente do staging e não cria
@@ -1629,6 +1787,377 @@ run_non_interactive() {
 }
 
 # ---------------------------------------------------------------------------
+# RESTAURAÇÃO SELETIVA (issue #9) — staging isolado por job, expira em 24h
+# ---------------------------------------------------------------------------
+# Acionado via:
+#   restic-restore.sh --hub-restore-item --snapshot <id> --token <tok> --job <job_id>
+#   restic-restore.sh --hub-cleanup [--job <job_id>]
+#
+# Cada job materializa SOMENTE o item apontado pelo token (arquivo ou
+# diretório) em ${HUB_ITEM_STAGING_DIR}/<job_id>/, isolado dos demais jobs e
+# de produção. Metadados (seleção, estado, destino, expiração) ficam em
+# meta.json no mesmo diretório. Só um job pode estar "running" por vez no
+# servidor (lock global) — o Restic, uma vez iniciado, não é cancelável.
+
+valid_job_id_selective() { [[ "$1" =~ ${JOB_ID_RE} ]]; }
+
+# job_dir/
+#   control/   meta.json, job.log, .ready — nunca no caminho do restic
+#   data/      --target real do Restic (só o conteúdo restaurado do item)
+# Separado de propósito: o item selecionado pode legitimamente ser um
+# arquivo/diretório raiz chamado "meta.json", "job.log" ou ".ready" — sem
+# essa separação, restaurar esse item sobrescreveria os próprios controles
+# do job no mesmo golpe.
+hub_item_job_dir()     { printf '%s/%s' "${HUB_ITEM_STAGING_DIR}" "$1"; }
+hub_item_control_dir() { printf '%s/%s/control' "${HUB_ITEM_STAGING_DIR}" "$1"; }
+hub_item_data_dir()    { printf '%s/%s/data' "${HUB_ITEM_STAGING_DIR}" "$1"; }
+hub_item_meta_file()   { printf '%s/%s/control/meta.json' "${HUB_ITEM_STAGING_DIR}" "$1"; }
+hub_item_log_file()    { printf '%s/%s/control/job.log' "${HUB_ITEM_STAGING_DIR}" "$1"; }
+hub_item_ready_file()  { printf '%s/%s/control/.ready' "${HUB_ITEM_STAGING_DIR}" "$1"; }
+
+# write_job_meta <job_id> <snapshot> <path> <item_type> <status> <created_at> <expires_at>
+# Grava atomicamente (mv sobre o mesmo fs). Campos alinhados ao pedido da
+# issue: seleção (snapshot/path/item_type), estado, destino (dir do job) e
+# expiração.
+write_job_meta() {
+    local job_id="$1" snap="$2" path="$3" item_type="$4" status="$5" created="$6" expires="$7"
+    local dir data_dir tmp
+    dir="$(hub_item_control_dir "${job_id}")"
+    data_dir="$(hub_item_data_dir "${job_id}")"
+    tmp="$(mktemp "${dir}/.meta.XXXXXX")" || return 1
+    if ! printf '{"version":%d,"job_id":"%s","snapshot":"%s","path":"%s","item_type":"%s","status":"%s","created_at":%d,"expires_at":%d,"staging_dir":"%s"}\n' \
+        "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "$(hub_json_escape "${snap}")" \
+        "$(hub_json_escape "${path}")" "$(hub_json_escape "${item_type}")" "$(hub_json_escape "${status}")" \
+        "${created}" "${expires}" "$(hub_json_escape "${data_dir}")" > "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    chgrp hubrestore "${tmp}" 2>/dev/null || true
+    chmod 640 "${tmp}" || { rm -f "${tmp}"; return 1; }
+    mv -f "${tmp}" "$(hub_item_meta_file "${job_id}")"
+}
+
+# Atualiza só o campo "status" do meta.json existente, preservando o resto.
+update_job_meta_status() {
+    local job_id="$1" status="$2" meta dir tmp
+    meta="$(hub_item_meta_file "${job_id}")"
+    [[ -f "${meta}" ]] || return 1
+    dir="$(hub_item_control_dir "${job_id}")"
+    tmp="$(mktemp "${dir}/.meta.XXXXXX")" || return 1
+    if ! perl -MJSON::PP -MEncode=decode_utf8 -e '
+        local $/;
+        my $data = decode_json(<STDIN>);
+        $data->{status} = decode_utf8($ARGV[0]);
+        print encode_json($data);
+    ' "${status}" < "${meta}" > "${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    chgrp hubrestore "${tmp}" 2>/dev/null || true
+    chmod 640 "${tmp}"
+    mv -f "${tmp}" "${meta}"
+}
+
+# Nenhum outro job "running" pode estar em andamento no servidor. O lock é
+# mantido pela DURAÇÃO do restic restore (fd aberto no processo atual);
+# como o Restic não é cancelável após iniciar, também não liberamos o lock
+# antes de terminar. Reusada pelo cleanup (fd diferente) para não remover um
+# job cujo dono real ainda está com o lock.
+hub_item_acquire_lock() {
+    local fd="${1:-9}"
+    mkdir -p "$(dirname "${HUB_ITEM_LOCK_FILE}")" 2>/dev/null || true
+    eval "exec ${fd}>\"\${HUB_ITEM_LOCK_FILE}\"" || return 1
+    flock -n "${fd}"
+}
+
+# now_epoch/finalize_job_meta centralizam a transição final: toda saída do
+# job (sucesso ou falha) grava status + finished_at antes de sair, para o
+# meta.json nunca ficar preso em "running" quando o processo termina.
+hub_item_finalize() {
+    local job_id="$1" status="$2" exit_code="${3:-1}"
+    local finished
+    finished="$(date +%s)"
+    if ! update_job_meta_status_finished "${job_id}" "${status}" "${finished}"; then
+        error "Job ${job_id}: falha ao gravar meta.json final (status pretendido: ${status}) — inconsistência auditável em ${RESTORE_LOG_FILE:-log indisponível}."
+        # A gravação final falhou: mesmo que o status pretendido fosse
+        # "success" (exit_code=0), o rc do processo não pode mentir que deu
+        # tudo certo quando o meta.json não reflete isso — força não-zero.
+        exit_code=1
+    fi
+    exit "${exit_code}"
+}
+
+# nonce vem do hub-restore-shell (imprevisível, gerado por tentativa) e é
+# gravado no marcador .ready SOMENTE depois de lock+job_dir+meta "running"
+# garantidos. O wrapper compara o conteúdo do marcador contra o nonce que
+# ele mesmo gerou antes de responder "ok" — um .ready de uma tentativa
+# anterior (job_id reciclado após cleanup, por exemplo) tem um nonce
+# diferente e não pode ser confundido com a preparação desta tentativa.
+run_hub_restore_item() {
+    local snap="$1" token="$2" job_id="$3" nonce="$4"
+    local now expires job_dir control_dir data_dir item_type path item_size
+
+    # Sinais herdados de uma sessão SSH que caia não devem interromper um
+    # Restic já iniciado — o desacoplamento real é feito pelo hub-restore-shell
+    # (setsid + redirecionamento), isto é defesa em profundidade caso o
+    # processo ainda herde o trap TERM/HUP do shell interativo.
+    trap '' TERM HUP
+
+    valid_job_id_selective "${job_id}" || die "job_id inválido: ${job_id}"
+    valid_snapshot_id "${snap}"        || die "snapshot inválido: ${snap}"
+    [[ "${nonce}" =~ ^[A-Za-z0-9_-]{16,128}$ ]] || die "nonce inválido."
+
+    mkdir -p "${HUB_ITEM_STAGING_DIR}" \
+        || die "Não foi possível criar ${HUB_ITEM_STAGING_DIR}."
+    chgrp hubrestore "${HUB_ITEM_STAGING_DIR}" 2>/dev/null || true
+    chmod 750 "${HUB_ITEM_STAGING_DIR}" 2>/dev/null || true
+
+    # Lock ANTES de qualquer checagem de existência do job_dir: sem isso, dois
+    # jobs concorrentes com o MESMO job_id poderiam ambos passar por um
+    # `[[ -e ]]` negativo antes de qualquer um criar o diretório (TOCTOU).
+    if ! hub_item_acquire_lock 9; then
+        die "outro job de restauração seletiva já está em execução neste servidor."
+    fi
+
+    job_dir="$(hub_item_job_dir "${job_id}")"
+    # mkdir (sem -p) é atômico: EEXIST aqui é a prova definitiva de job_id
+    # duplicado, sem a janela de tempo entre "checar" e "criar".
+    if ! mkdir "${job_dir}" 2>/dev/null; then
+        die "job ${job_id} já existe — job_id deve ser único."
+    fi
+    chmod 750 "${job_dir}"
+    chgrp hubrestore "${job_dir}" 2>/dev/null || true
+
+    # control/ (meta.json, job.log, .ready) e data/ (--target do Restic) são
+    # subdiretórios separados: o item selecionado pode legitimamente se
+    # chamar "meta.json" ou ".ready" no snapshot, e restaurá-lo não pode
+    # sobrescrever os controles do próprio job.
+    control_dir="$(hub_item_control_dir "${job_id}")"
+    data_dir="$(hub_item_data_dir "${job_id}")"
+    mkdir "${control_dir}" "${data_dir}" || die "Job ${job_id}: falha ao criar control/data em ${job_dir}."
+    chmod 750 "${control_dir}" "${data_dir}"
+    chgrp hubrestore "${control_dir}" "${data_dir}" 2>/dev/null || true
+
+    RESTORE_LOG_FILE="$(hub_item_log_file "${job_id}")"
+    : > "${RESTORE_LOG_FILE}" 2>/dev/null || true
+    chgrp hubrestore "${RESTORE_LOG_FILE}" 2>/dev/null || true
+    chmod 640 "${RESTORE_LOG_FILE}" 2>/dev/null || true
+
+    now="$(date +%s)"
+    expires=$((now + HUB_ITEM_TTL_SECONDS))
+
+    require_root
+    if ! hub_decode_token "${snap}" "${token}" 2>>"${RESTORE_LOG_FILE}"; then
+        write_job_meta "${job_id}" "${snap}" "" "unknown" "running" "${now}" "${expires}" \
+            || error "Job ${job_id}: falha ao gravar meta.json inicial."
+        hub_item_finalize "${job_id}" "failed invalid_token" 1
+    fi
+    path="${G_SELECTED}"
+
+    write_job_meta "${job_id}" "${snap}" "${path}" "unknown" "running" "${now}" "${expires}" \
+        || die "Job ${job_id}: falha ao gravar meta.json inicial — abortando antes do Restic."
+    info "Job ${job_id}: restauração seletiva iniciada — snapshot ${snap}, item ${path}."
+
+    # Handshake com o hub-restore-shell: a partir daqui lock + job_dir +
+    # meta.json "running" estão garantidos (todas as rejeições possíveis —
+    # job duplicado via EEXIST do mkdir, lock ocupado, token inválido — já
+    # aconteceram acima e teriam terminado o processo antes deste ponto). O
+    # wrapper compara o conteúdo do marcador contra o nonce que ele mesmo
+    # gerou — grava-lo é obrigatório: se a escrita falhar, o wrapper nunca vê
+    # o nonce esperado e trata como falha, então uma falha aqui tem que
+    # derrubar o job (não seguir tentando o Restic sem handshake confirmado).
+    if ! printf '%s' "${nonce}" > "$(hub_item_ready_file "${job_id}")" 2>/dev/null; then
+        hub_item_finalize "${job_id}" "failed não foi possível gravar o marcador de handshake" 1
+    fi
+    chgrp hubrestore "$(hub_item_ready_file "${job_id}")" 2>/dev/null || true
+    chmod 640 "$(hub_item_ready_file "${job_id}")" 2>/dev/null || true
+
+    if ! load_env_file_safe 2>>"${RESTORE_LOG_FILE}"; then
+        hub_item_finalize "${job_id}" "failed env: ${RESTIC_ENV_FILE} indisponível/inválido" 1
+    fi
+    if ! validate_env_safe 2>>"${RESTORE_LOG_FILE}"; then
+        hub_item_finalize "${job_id}" "failed variáveis obrigatórias ausentes em ${RESTIC_ENV_FILE}" 1
+    fi
+    export_restic_env
+
+    if ! check_repo_safe 2>>"${RESTORE_LOG_FILE}"; then
+        hub_item_finalize "${job_id}" "failed não foi possível abrir o repositório restic" 1
+    fi
+    if ! restic snapshots "${snap}" >/dev/null 2>>"${RESTORE_LOG_FILE}"; then
+        hub_item_finalize "${job_id}" "failed snapshot ${snap} não encontrado" 1
+    fi
+    if ! hub_get_item "${snap}" "${path}" 2>>"${RESTORE_LOG_FILE}"; then
+        hub_item_finalize "${job_id}" "failed item ${path} não encontrado no snapshot" 1
+    fi
+    case "${G_ITEM_TYPE}" in
+        d) item_type="directory" ;;
+        f) item_type="file" ;;
+        *) hub_item_finalize "${job_id}" "failed tipo de item não suportado" 1 ;;
+    esac
+    # G_ITEM_SIZE de um diretório vem 0 do Restic (nó não soma filhos); sem
+    # recalcular, check_free_space_fail_closed cairia no MIN_FREE_MB genérico
+    # e poderia liberar espaço insuficiente para o conteúdo real. Fail-closed:
+    # se não conseguir somar, falha aqui em vez de seguir com 0.
+    if [[ "${item_type}" == "directory" ]]; then
+        if ! hub_dir_total_size "${snap}" "${path}" 2>>"${RESTORE_LOG_FILE}"; then
+            hub_item_finalize "${job_id}" "failed não foi possível calcular o tamanho do diretório" 1
+        fi
+    fi
+    item_size="${G_ITEM_SIZE:-0}"
+    write_job_meta "${job_id}" "${snap}" "${path}" "${item_type}" "running" "${now}" "${expires}" \
+        || hub_item_finalize "${job_id}" "failed erro ao persistir meta.json antes do Restic" 1
+
+    if ! check_free_space_fail_closed "${data_dir}" "${item_size}" 2>>"${RESTORE_LOG_FILE}"; then
+        hub_item_finalize "${job_id}" "failed espaço livre insuficiente no staging" 1
+    fi
+
+    step "Job ${job_id}: restaurando ${path} (${item_type}) do snapshot ${snap} → ${data_dir}"
+    if run_restore_exact "${snap}" "${path}" "${data_dir}"; then
+        info "Job ${job_id}: restauração concluída em ${data_dir}."
+        hub_item_finalize "${job_id}" "success" 0
+    else
+        error "Job ${job_id}: restauração falhou. Veja ${RESTORE_LOG_FILE}."
+        hub_item_finalize "${job_id}" "failed restic restore retornou erro — veja ${RESTORE_LOG_FILE}" 1
+    fi
+}
+
+# Igual a update_job_meta_status, mas também grava finished_at — chamada só
+# nas transições finais (success/failed), nunca em "running".
+update_job_meta_status_finished() {
+    local job_id="$1" status="$2" finished="$3" meta dir tmp
+    meta="$(hub_item_meta_file "${job_id}")"
+    [[ -f "${meta}" ]] || return 1
+    dir="$(hub_item_control_dir "${job_id}")"
+    tmp="$(mktemp "${dir}/.meta.XXXXXX")" || return 1
+    if ! perl -MJSON::PP -MEncode=decode_utf8 -e '
+        local $/;
+        my $data = decode_json(<STDIN>);
+        $data->{status} = decode_utf8($ARGV[0]);
+        $data->{finished_at} = $ARGV[1] + 0;
+        print encode_json($data);
+    ' "${status}" "${finished}" < "${meta}" > "${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    chgrp hubrestore "${tmp}" 2>/dev/null || true
+    chmod 640 "${tmp}"
+    mv -f "${tmp}" "${meta}"
+}
+
+# Remove um job expirado ou indicado explicitamente. Nunca aceita caminho
+# arbitrário: sempre reconstrói o destino a partir de HUB_ITEM_STAGING_DIR +
+# job_id validado, e confirma que o resultado é de fato um filho direto
+# daquele diretório antes de apagar. Só remove depois de confirmar (com o
+# lock global adquirido) que nenhum restore-item está com o job em "running"
+# — evita apagar staging por baixo de uma restauração em andamento.
+#
+# hub_item_remove_job <job_id> [allow_expired_running]
+# allow_expired_running=1 é usado SÓ pela varredura de cron: com o lock em
+# mãos (prova de que nenhum restore-item está de fato ativo agora), um
+# status "running" cujo expires_at já passou é necessariamente órfão —
+# processo morto por crash/SIGKILL/reboot antes de finalizar o job, nunca
+# vai liberar o lock nem atualizar o meta.json sozinho. Sem essa exceção,
+# esse staging ficaria preso para sempre, quebrando a garantia de expiração
+# em 24h. Exclusão ANTECIPADA (chamada explícita por job_id) nunca passa
+# allow_expired_running=1 — running running é sempre recusado ali, mesmo
+# expirado, para não apagar por engano algo que o operador não pediu.
+hub_item_remove_job() {
+    local job_id="$1" allow_expired_running="${2:-0}"
+    local dir resolved_dir resolved_base meta status expires_at now
+
+    valid_job_id_selective "${job_id}" || return 1
+    dir="$(hub_item_job_dir "${job_id}")"
+    [[ -d "${dir}" ]] || return 0
+
+    # Lock não bloqueante em fd próprio (10): se outro processo (restore-item
+    # do MESMO job, ou outro comando hub-cleanup) já segura o lock global, não
+    # arriscamos apagar staging de um job possivelmente em andamento.
+    if ! hub_item_acquire_lock 10; then
+        warn "Job ${job_id}: lock de restauração seletiva ocupado — limpeza recusada (pode haver job ativo)."
+        return 1
+    fi
+
+    # Revalida o status DEPOIS de segurar o lock: um restore-item que tenha
+    # terminado entre a checagem anterior e agora já teria liberado o lock,
+    # então chegar aqui com o lock em mãos garante que "running" é o estado
+    # real, não uma leitura obsoleta.
+    meta="$(hub_item_meta_file "${job_id}")"
+    if [[ -f "${meta}" ]]; then
+        status="$(perl -MJSON::PP -e 'local $/; my $d = eval { decode_json(<STDIN>) }; print $d->{status} // "" if ref $d eq "HASH";' < "${meta}" 2>/dev/null)"
+        if [[ "${status}" == "running" ]]; then
+            expires_at="$(perl -MJSON::PP -e 'local $/; my $d = eval { decode_json(<STDIN>) }; print $d->{expires_at} // "" if ref $d eq "HASH";' < "${meta}" 2>/dev/null)"
+            now="$(date +%s)"
+            if [[ "${allow_expired_running}" == "1" && "${expires_at}" =~ ^[0-9]+$ && now -ge expires_at ]]; then
+                warn "Job ${job_id}: status running mas expirado (órfão — lock livre e expires_at no passado); removendo."
+            else
+                warn "Job ${job_id}: status running — limpeza recusada."
+                exec 10>&-
+                return 1
+            fi
+        fi
+    fi
+
+    resolved_base="$(cd "${HUB_ITEM_STAGING_DIR}" 2>/dev/null && pwd -P)" || { exec 10>&-; return 1; }
+    resolved_dir="$(cd "${dir}" 2>/dev/null && pwd -P)" || { exec 10>&-; return 1; }
+    if [[ "${resolved_dir}" != "${resolved_base}/${job_id}" ]]; then
+        exec 10>&-
+        return 1
+    fi
+
+    rm -rf -- "${resolved_dir}"
+    local remove_rc=$?
+    exec 10>&-
+    return "${remove_rc}"
+}
+
+# Limpeza idempotente: sem --job, varre todos os jobs expirados (rodada via
+# cron a cada N minutos). Com --job, apaga só aquele (exclusão antecipada).
+# Idempotente nos dois casos: job/staging já ausente não é erro. Job "running"
+# só é removido pela varredura quando já passou de expires_at (órfão de
+# crash/SIGKILL/reboot); a exclusão antecipada por --job nunca remove um job
+# "running", mesmo expirado.
+run_hub_cleanup() {
+    local target_job="${1:-}" job_id meta expires job_dir now removed=0
+
+    [[ -d "${HUB_ITEM_STAGING_DIR}" ]] || { info "Nada a limpar (${HUB_ITEM_STAGING_DIR} não existe)."; return 0; }
+
+    if [[ -n "${target_job}" ]]; then
+        valid_job_id_selective "${target_job}" || die "job_id inválido: ${target_job}"
+        if hub_item_remove_job "${target_job}"; then
+            info "Job ${target_job}: staging removido (exclusão antecipada ou já ausente)."
+        else
+            die "Falha ao remover staging do job ${target_job} (ausente, lock ocupado ou job em execução)."
+        fi
+        return 0
+    fi
+
+    now="$(date +%s)"
+    for job_dir in "${HUB_ITEM_STAGING_DIR}"/*/; do
+        [[ -d "${job_dir}" ]] || continue
+        job_id="$(basename -- "${job_dir}")"
+        valid_job_id_selective "${job_id}" || continue
+        meta="$(hub_item_meta_file "${job_id}")"
+        expires=""
+        if [[ -f "${meta}" ]]; then
+            expires="$(perl -MJSON::PP -e 'local $/; my $d = decode_json(<STDIN>); print $d->{expires_at} // "";' < "${meta}" 2>/dev/null)"
+        fi
+        # meta ausente/corrompido (queda do cliente a meio caminho) também expira
+        # — usa mtime do diretório como fallback.
+        if [[ ! "${expires}" =~ ^[0-9]+$ ]]; then
+            expires=$(( $(stat -c '%Y' "${job_dir}" 2>/dev/null || stat -f '%m' "${job_dir}" 2>/dev/null || echo "${now}") + HUB_ITEM_TTL_SECONDS ))
+        fi
+        (( now < expires )) && continue
+        if hub_item_remove_job "${job_id}" 1; then
+            info "Job ${job_id}: expirado, staging removido."
+            removed=$((removed + 1))
+        else
+            warn "Job ${job_id}: falha ao remover staging expirado (ausente, lock ocupado ou em execução)."
+        fi
+    done
+    info "Limpeza concluída: ${removed} job(s) removido(s)."
+}
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -1646,6 +2175,13 @@ Uso:
   sudo restic-restore.sh --hub-preflight --snapshot <id> --token <token> \
       --expect-type <file|directory>
                                     # API JSON read-only; uso interno do wrapper
+  sudo restic-restore.sh --hub-restore-item --snapshot <id> --token <token> \
+      --job <job_id>
+                                    # restaura SÓ o item do token p/ staging
+                                    # isolado do job, expira em 24h (issue #9)
+  sudo restic-restore.sh --hub-cleanup [--job <job_id>]
+                                    # remove staging(s) de item expirado(s);
+                                    # com --job, exclusão antecipada de um job
 
 O script carrega /etc/restic/env (o mesmo do backup), abre o repositório no
 S3 e oferece um menu para restaurar arquivos, sites e bancos de dados de
@@ -1662,11 +2198,14 @@ Modo --non-interactive usa caminhos fixos (não configuráveis, para bater
 com o wrapper hub-restore-shell):
   log:    /var/log/hub-restore/<job_id>.log
   status: /var/lib/hub-restore/<job_id>.status
+
+Modo --hub-restore-item usa caminho fixo (mesmo motivo):
+  staging: /var/lib/hub-restore/items/<job_id>/ (log e meta.json dentro)
 HELP
 }
 
 main() {
-    local mode="interactive" snap_arg="" job_arg="" token_arg="" expected_type=""
+    local mode="interactive" snap_arg="" job_arg="" token_arg="" expected_type="" nonce_arg=""
 
     while (( $# > 0 )); do
         case "$1" in
@@ -1680,6 +2219,12 @@ main() {
             --hub-preflight)
                 [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
                 mode="hub-preflight"; shift ;;
+            --hub-restore-item)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-restore-item"; shift ;;
+            --hub-cleanup)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-cleanup"; shift ;;
             --snapshot)
                 [[ $# -ge 2 ]] || { echo "--snapshot exige um valor" >&2; exit 1; }
                 snap_arg="$2"; shift 2 ;;
@@ -1692,6 +2237,9 @@ main() {
             --expect-type)
                 [[ $# -ge 2 ]] || { echo "--expect-type exige um valor" >&2; exit 1; }
                 expected_type="$2"; shift 2 ;;
+            --nonce)
+                [[ $# -ge 2 ]] || { echo "--nonce exige um valor" >&2; exit 1; }
+                nonce_arg="$2"; shift 2 ;;
             *) echo "Argumento desconhecido: $1" >&2; exit 1 ;;
         esac
     done
@@ -1702,8 +2250,8 @@ main() {
     if [[ "${mode}" == "restore" ]]; then
         [[ -n "${snap_arg}" ]] || { echo "--non-interactive exige --snapshot <id>" >&2; exit 1; }
         [[ -n "${job_arg}" ]]  || { echo "--non-interactive exige --job <job_id>" >&2; exit 1; }
-        [[ -z "${token_arg}" && -z "${expected_type}" ]] \
-            || { echo "--token/--expect-type não pertencem ao modo de restauração" >&2; exit 1; }
+        [[ -z "${token_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { echo "--token/--expect-type/--nonce não pertencem ao modo de restauração" >&2; exit 1; }
         run_non_interactive "${snap_arg}" "${job_arg}"
         return
     fi
@@ -1711,7 +2259,7 @@ main() {
     if [[ "${mode}" == "hub-list" ]]; then
         valid_snapshot_id "${snap_arg}" \
             || { hub_json_error "invalid_snapshot" "Identificador de snapshot inválido."; exit 1; }
-        [[ -z "${job_arg}" && -z "${expected_type}" ]] \
+        [[ -z "${job_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
             || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
         run_hub_list "${snap_arg}" "${token_arg}"
         return
@@ -1720,15 +2268,33 @@ main() {
     if [[ "${mode}" == "hub-preflight" ]]; then
         valid_snapshot_id "${snap_arg}" \
             || { hub_json_error "invalid_snapshot" "Identificador de snapshot inválido."; exit 1; }
-        [[ -z "${job_arg}" && -n "${token_arg}" \
+        [[ -z "${job_arg}" && -z "${nonce_arg}" && -n "${token_arg}" \
             && ( "${expected_type}" == "file" || "${expected_type}" == "directory" ) ]] \
             || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
         run_hub_preflight "${snap_arg}" "${token_arg}" "${expected_type}"
         return
     fi
 
+    if [[ "${mode}" == "hub-restore-item" ]]; then
+        [[ -n "${snap_arg}" ]]  || { echo "--hub-restore-item exige --snapshot <id>" >&2; exit 1; }
+        [[ -n "${token_arg}" ]] || { echo "--hub-restore-item exige --token <token>" >&2; exit 1; }
+        [[ -n "${job_arg}" ]]   || { echo "--hub-restore-item exige --job <job_id>" >&2; exit 1; }
+        [[ -n "${nonce_arg}" ]] || { echo "--hub-restore-item exige --nonce <valor>" >&2; exit 1; }
+        [[ -z "${expected_type}" ]] \
+            || { echo "--expect-type não pertence a --hub-restore-item" >&2; exit 1; }
+        run_hub_restore_item "${snap_arg}" "${token_arg}" "${job_arg}" "${nonce_arg}"
+        return
+    fi
+
+    if [[ "${mode}" == "hub-cleanup" ]]; then
+        [[ -z "${snap_arg}" && -z "${token_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { echo "--hub-cleanup só aceita --job" >&2; exit 1; }
+        run_hub_cleanup "${job_arg}"
+        return
+    fi
+
     # Flags de modos remotos nunca são ignoradas no menu interativo.
-    if [[ -n "${snap_arg}" || -n "${job_arg}" || -n "${token_arg}" || -n "${expected_type}" ]]; then
+    if [[ -n "${snap_arg}" || -n "${job_arg}" || -n "${token_arg}" || -n "${expected_type}" || -n "${nonce_arg}" ]]; then
         echo "Flags remotas exigem um modo explícito" >&2
         exit 1
     fi
