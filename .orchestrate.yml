@@ -51,7 +51,12 @@ models:
       family: openai
       model: gpt-5.6-sol
       effort: high
-    adversarial:
+    fable:
+      agent: claude
+      family: anthropic
+      model: fable
+      effort: high
+    sonnet:
       agent: claude
       family: anthropic
       model: sonnet
@@ -79,6 +84,8 @@ models:
       "agent:balanced": balanced
       "agent:efficient": efficient
       "agent:efficient-max": efficient_max
+      "agent:fable": fable
+      "agent:sonnet": sonnet
 
 coordinator:
   normal: balanced
@@ -112,9 +119,12 @@ roles:
   adversarial_reviewer:
     profile: adversarial-reviewer
     phase: quality
-    model: adversarial
+    model_by_implementer_family:
+      openai: sonnet
+      anthropic: strongest
     writes: false
     require_different_family_from_implementer: true
+    on_unmapped_family: block
 
 preview:
   enabled: false
@@ -160,6 +170,8 @@ quality:
     enabled: true
     comment_on_pr: true
     coordinator_confirms_findings: true
+    require_different_family_from_implementer: true
+    on_unavailable_different_family: block
     max_fix_cycles: 3
   require_acceptance_evidence: true
   forbid_unrequested_removals: true
