@@ -571,6 +571,17 @@ nem os que apontam para fora dele.
 `staging-stat` confirma tipo (`file`/`directory`) e tamanho em bytes de um
 item específico do staging, sem ler o conteúdo.
 
+Quando a leitura acontece pelo descritor já aberto (ver "Abertura por
+descritor" abaixo), o caminho passado a `find`/`du` é `/proc/self/fd/<n>` —
+um symlink no Linux. `find`/`du` **não** dereferenciam por padrão um symlink
+passado como argumento inicial; sem a flag `-H`, `staging-list` de um
+diretório retornaria uma listagem vazia (ao invés do conteúdo real) e
+`staging-stat` de um diretório mediria o link em si (poucos bytes) em vez da
+árvore. Por isso `find -H`/`du -H` são usados sempre que o caminho pode vir
+desse ramo — `-H` só afeta o argumento inicial da travessia, sem enfraquecer
+nenhuma outra proteção (symlinks encontrados durante a travessia continuam
+não seguidos).
+
 `staging-download` transmite o item em **stdout**: um arquivo vai cru (sem
 transformação, sem ser carregado inteiro em memória — o kernel faz o
 streaming via `cat`); um diretório é empacotado sob demanda como `tar`
@@ -624,8 +635,13 @@ pulada e a proteção fica só na validação de caminho e no lock.
 **Sinal durante o download não contamina o stream.** Um `TERM`/`INT`
 recebido enquanto `staging-download` está transmitindo não pode injetar
 texto (aviso de "interrompido") no meio dos bytes binários já em stdout — o
-trap de sinal do processo verifica um sinalizador interno e, durante o
-download, escreve exclusivamente em stderr/log, nunca em stdout.
+trap de sinal do processo verifica um sinalizador interno (ligado no início
+de `run_hub_staging_download`) e, enquanto ativo, escreve exclusivamente em
+stderr/log. O sinalizador é desligado apenas nos caminhos de erro **antes**
+de qualquer byte de conteúdo ser emitido (validação de job/token/lock); a
+partir do momento em que `cat`/`tar` começa a escrever, ele permanece ligado
+até o processo terminar — nada depois disso volta a tocar stdout, então não
+há necessidade (nem seria seguro) de desligá-lo antes do fim.
 
 **Exclusão antecipada.** Não há um comando novo para isso — `cleanup
 <job_id>` (o mesmo do restore seletivo, issue #9) já remove o staging

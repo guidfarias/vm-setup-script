@@ -492,130 +492,177 @@ pass "forced command recusa staging-list/stat/download malformados antes de alca
 HAVE_FLOCK=1
 command -v flock >/dev/null 2>&1 || HAVE_FLOCK=0
 
-# Job dedicado a este cenário (não reaproveita READY_JOB, que a esta altura
-# já foi apagado/recriado por cenários anteriores e teria só pequeno.txt).
-TERM_JOB="job-term-1"
-write_meta "${TERM_JOB}" "success" "${future}"
-TERM_DATA="${ITEM_STAGING_DIR}/${TERM_JOB}/data"
-mkdir -p "${TERM_DATA}"
-head -c 5000000 /dev/urandom > "${TERM_DATA}/grande.bin" 2>/dev/null \
-    || dd if=/dev/zero of="${TERM_DATA}/grande.bin" bs=1024 count=4883 2>/dev/null
-TOKEN_TERM_GRANDE="$(token_for_rel_path "${TERM_JOB}" "/grande.bin")"
+# 17. TERM durante o download não pode injetar texto no meio do stream.
+#
+# Tentativa anterior desta suíte matava (`kill -TERM`) um `staging-download`
+# real bloqueado escrevendo num FIFO com leitor lento. Verificado à mão
+# neste ambiente (múltiplas variações, inclusive com /bin/kill externo em
+# vez do builtin): quando o comando em primeiro plano é `cat`/`tar` externo
+# bloqueado em write() de um pipe cheio, o processo às vezes morre por
+# SIGPIPE/KILL sem o bash pai chegar a rodar o trap — não é uma falha do
+# código sob teste, é uma característica de timing entre sinal, bash e
+# comando externo bloqueado em I/O que este ambiente não garante de forma
+# confiável (processo pode morrer via bytes já enfileirados no pipe antes do
+# handler despachar). Um teste que dependa disso é ele mesmo não-confiável:
+# a rodada anterior "passava" tanto com o código corrigido quanto com
+# restaurar_backup.sh totalmente revertido a 37abe6c, porque na prática o
+# TERM raramente chegava a acionar QUALQUER trap em nenhum dos dois casos.
+#
+# Este cenário substitui aquela abordagem por uma determinística: extrai o
+# trecho REAL do arquivo (trap + cleanup() + funções de log de que o trap
+# depende, cortando antes de qualquer coisa que chame main) e o executa num
+# subprocesso que AUTOSSINALIZA (`kill -TERM $$`) depois de simular o estado
+# "no meio do download" (HUB_STDOUT_IS_BINARY=true). Autossinalização é
+# processada de forma síncrona e 100% confiável pelo bash (verificado): o
+# handler roda sempre, eliminando a variável de timing entre processos que
+# tornava o cenário anterior inconclusivo. O que é exercitado é o MESMO
+# trecho de código de produção, sem reescrever a lógica do trap no teste —
+# só o gancho que dispara o sinal é diferente de um `cat`/`tar` real
+# bloqueado.
+extract_trap_snippet() {
+    local restore_file="$1" out_file="$2"
+    local end_line
+    end_line="$(grep -n '^die() { error "\$\*"; exit 1; }$' "${restore_file}" | head -1 | cut -d: -f1)"
+    [[ -n "${end_line}" ]] || return 1
+    head -n "${end_line}" "${restore_file}" > "${out_file}"
+}
 
-# 17. TERM durante o download não pode injetar texto no meio do stream: a
-# flag HUB_STDOUT_IS_BINARY faz o trap de sinal (topo de restaurar_backup.sh)
-# escrever só em stderr/log quando ativa. Para garantir determinismo (não
-# depender da velocidade do disco terminar antes do kill), o stdout do
-# processo é escrito num FIFO cujo leitor consome DEVAGAR (1 byte por vez,
-# com sleep) — isso aplica backpressure real no pipe e mantém o `cat`/`tar`
-# de dentro de run_hub_staging_download genuinamente bloqueado no meio da
-# escrita até o sinal chegar, sem alterar o código de produção.
-FIFO_PATH="${TMP_DIR}/download.fifo"
-rm -f "${FIFO_PATH}"
-mkfifo "${FIFO_PATH}"
-: > "${OUT_FILE}"; : > "${ERR_FILE}"
-(
-    # dd (não `read` do bash) para não corromper bytes binários — bash
-    # `read` é orientado a linha/delimitador e não é seguro para dados
-    # arbitrários (NUL, sequências que colidem com o delimitador). Blocos de
-    # 4KB com uma pausa entre cada leitura aplicam a mesma backpressure sem
-    # arriscar a integridade do conteúdo. O loop para quando um bloco lido
-    # tem 0 bytes (EOF do FIFO) — o rc de `dd` sozinho não distingue isso.
-    CHUNK="${TMP_DIR}/download.chunk"
-    while true; do
-        dd if="${FIFO_PATH}" bs=4096 count=1 of="${CHUNK}" 2>/dev/null
-        [[ -s "${CHUNK}" ]] || break
-        cat "${CHUNK}" >> "${OUT_FILE}"
-        sleep 0.02
-    done
-) &
-READER_PID=$!
-env \
-    PATH="${MOCK_BIN}:${PATH}" \
-    RESTIC_ENV_FILE="${ENV_FILE}" \
-    RESTORE_LOG_FILE="${RESTORE_LOG}" \
-    RESTIC_RESTORE_ALLOW_NONROOT=1 \
-    "${RESTORE_COPY}" --hub-staging-download --job "${TERM_JOB}" --token "${TOKEN_TERM_GRANDE}" \
-    >"${FIFO_PATH}" 2>"${ERR_FILE}" &
-DOWNLOAD_PID=$!
-# Espera o arquivo de saída começar a crescer (prova que o leitor devagar já
-# está drenando o FIFO e o cat/tar de dentro do download está bloqueado na
-# escrita) antes de mandar o sinal.
-GREW=0
-for _ in $(seq 1 100); do
-    if [[ -s "${OUT_FILE}" ]]; then
-        GREW=1
-        break
-    fi
-    sleep 0.05
-done
-[[ "${GREW}" == "1" ]] || fail "leitor devagar do FIFO não recebeu nenhum byte a tempo (setup do teste de TERM)"
-kill -TERM "${DOWNLOAD_PID}" 2>/dev/null || true
-# Watchdog: se o TERM não derrubar o processo rapidamente (não deveria
-# acontecer — write() bloqueado é interrompido pelo sinal — mas evita travar
-# o teste indefinidamente se algo no ambiente se comportar diferente), força
-# com KILL depois de uma folga curta.
-( sleep 5; kill -KILL "${DOWNLOAD_PID}" 2>/dev/null || true ) &
-WATCHDOG_PID=$!
-wait "${DOWNLOAD_PID}" 2>/dev/null
-kill "${WATCHDOG_PID}" 2>/dev/null || true
-wait "${WATCHDOG_PID}" 2>/dev/null || true
-# Não há um jeito portátil e rápido de sinalizar EOF ao leitor devagar sem
-# arriscar travar o teste (o writer já morreu; reabrir o FIFO para fechar em
-# seguida nem sempre acorda um `read` bloqueado a tempo em todo shell). Como
-# o que importa já foi capturado em OUT_FILE no momento do kill, o leitor é
-# encerrado diretamente — ele é um subshell descartável deste cenário, sem
-# nenhum estado que precise de finalização graciosa.
-kill -KILL "${READER_PID}" 2>/dev/null || true
-wait "${READER_PID}" 2>/dev/null || true
-rm -f "${FIFO_PATH}"
-assert_not_contains "${OUT_FILE}" "Interrompido pelo usuário" "TERM durante o stream não pode injetar aviso no stdout binário"
-assert_not_contains "${OUT_FILE}" "AVISO" "TERM durante o stream não pode injetar tag de log no stdout binário"
-head -c "$(wc -c < "${OUT_FILE}" | tr -d ' ')" "${TERM_DATA}/grande.bin" > "${TMP_DIR}/expected-prefix"
-cmp -s "${OUT_FILE}" "${TMP_DIR}/expected-prefix" \
-    || fail "bytes recebidos antes do TERM não são um prefixo exato do arquivo original (stream contaminado)"
-pass "sinal TERM recebido durante o streaming de download não contamina o stdout binário"
+# run_trap_snippet <restore_file> <binary:true|false> → stdout/stderr/rc do
+# subprocesso capturados em OUT_FILE/ERR_FILE/RUN_RC, igual às outras
+# run_* deste arquivo.
+run_trap_snippet() {
+    local restore_file="$1" binary="$2" snippet runner
+    snippet="${TMP_DIR}/trap_snippet.sh"
+    runner="${TMP_DIR}/trap_runner.sh"
+    extract_trap_snippet "${restore_file}" "${snippet}" \
+        || fail "não foi possível extrair o trecho do trap de ${restore_file} (die() não encontrado — arquivo mudou de forma incompatível com este teste)"
+    {
+        cat "${snippet}"
+        echo
+        printf 'RESTORE_LOG_FILE=%q\n' "${TMP_DIR}/trap_snippet.log"
+        : > "${TMP_DIR}/trap_snippet.log"
+        [[ "${binary}" == "true" ]] && echo 'HUB_STDOUT_IS_BINARY=true'
+        echo '# Simula bytes já emitidos no stdout ANTES do sinal chegar —'
+        echo '# é exatamente esse conteúdo que não pode ganhar uma cauda de'
+        echo '# texto se o trap disparar logo em seguida.'
+        echo 'printf "BYTES_JA_EMITIDOS"'
+        echo 'kill -TERM $$'
+        echo 'echo "NAO_DEVERIA_CHEGAR_AQUI: trap não interrompeu a execução"'
+    } > "${runner}"
+    : > "${OUT_FILE}"; : > "${ERR_FILE}"
+    bash "${runner}" >"${OUT_FILE}" 2>"${ERR_FILE}"
+    RUN_RC=$?
+}
 
-# 18. Corrida cleanup vs leitura: um leitor (staging-download) segurando o
-# lock COMPARTILHADO deve bloquear um cleanup concorrente (lock exclusivo)
-# até o leitor soltar — prova que a exclusão mútua kernel-level (flock) está
-# de fato em vigor, não só documentada. Mesmo padrão de sincronização
-# determinística de tests/hub-selective-restore.sh (cenário 12): um processo
-# em background segura o lock e sinaliza via arquivo sentinela, sem polling
-# que competiria pelo próprio lock.
+run_trap_snippet "${ROOT_DIR}/restaurar_backup.sh" true
+assert_eq "130" "${RUN_RC}" "trap de TERM deve terminar com rc 130 (modo binário)"
+assert_eq "BYTES_JA_EMITIDOS" "$(cat "${OUT_FILE}")" \
+    "com HUB_STDOUT_IS_BINARY=true, TERM não pode acrescentar nada além dos bytes já emitidos"
+assert_not_contains "${OUT_FILE}" "Interrompido" "TERM durante o download não pode injetar aviso no stdout binário"
+assert_not_contains "${OUT_FILE}" "AVISO" "TERM durante o download não pode injetar tag de log no stdout binário"
+assert_not_contains "${OUT_FILE}" "NAO_DEVERIA_CHEGAR_AQUI" "trap deve interromper a execução (exit), não deixar o script continuar"
+
+# Controle negativo: com a flag "false" (fora do modo de download), o MESMO
+# trap real deve continuar avisando em texto — prova que o teste acima
+# discrimina de verdade o estado da flag, não é uma checagem que sempre dá
+# "sem texto" independente do código.
+run_trap_snippet "${ROOT_DIR}/restaurar_backup.sh" false
+assert_eq "130" "${RUN_RC}" "trap de TERM deve terminar com rc 130 (modo texto)"
+assert_contains "${OUT_FILE}" "Interrompido pelo usuário" "fora do modo de download, o trap deve avisar normalmente em stdout (controle negativo)"
+pass "trap de TERM respeita HUB_STDOUT_IS_BINARY: silencioso durante download, textual fora dele (controle negativo incluído)"
+
+# 18. Corrida cleanup vs leitura: um `staging-download` REAL (não um holder
+# `flock -s` sintético — achado da rodada anterior: um holder sintético só
+# prova que "flock -s existe e funciona no SO", não que
+# run_hub_staging_download de fato CHAMA hub_item_acquire_lock_shared antes
+# de ler) precisa bloquear um `cleanup` concorrente (lock exclusivo) até
+# terminar — prova que o código de produção realmente adquire e mantém o
+# lock durante toda a leitura, não só que o mecanismo do SO funciona
+# isoladamente.
 if (( HAVE_FLOCK )); then
-    HOLD_SENTINEL="${TMP_DIR}/staging-holder.locked"
-    RELEASE_SENTINEL="${TMP_DIR}/staging-holder.release"
-    rm -f "${HOLD_SENTINEL}" "${RELEASE_SENTINEL}"
+    RACE_JOB="job-race-1"
+    write_meta "${RACE_JOB}" "success" "${future}"
+    RACE_DATA="${ITEM_STAGING_DIR}/${RACE_JOB}/data"
+    mkdir -p "${RACE_DATA}"
+    # 300MB: verificado à parte (script de diagnóstico isolado) que um
+    # arquivo pequeno (5MB) faz o `cat` real de dentro de
+    # run_hub_staging_download terminar de escrever no FIFO rápido demais
+    # (buffer do pipe absorve tudo antes do cleanup rodar) — precisa de
+    # volume suficiente para garantir uma janela de bloqueio real e
+    # mensurável, independente da velocidade de I/O local.
+    head -c 300000000 /dev/urandom > "${RACE_DATA}/grande.bin" 2>/dev/null \
+        || dd if=/dev/zero of="${RACE_DATA}/grande.bin" bs=1048576 count=300 2>/dev/null
+    TOKEN_RACE_GRANDE="$(token_for_rel_path "${RACE_JOB}" "/grande.bin")"
+
+    # FIFO com leitor que ABRE o descritor de leitura IMEDIATAMENTE (antes do
+    # download começar), mas só CONSOME depois de um delay. Diferença crucial
+    # em relação a uma tentativa anterior desta suíte: `> FIFO` num
+    # redirecionamento bloqueia a própria ABERTURA até existir um leitor —
+    # atrasar o leitor (com um `sleep` antes de sequer abrir o FIFO) atrasava
+    # o INÍCIO do processo de download inteiro, não criava uma janela de
+    # bloqueio no MEIO do cat como a intenção do cenário exige (verificado
+    # com um script de diagnóstico isolado: nesse caso o download morria
+    # "cedo" só porque na prática ele nunca tinha começado a rodar de
+    # verdade). Aqui o leitor abre o fd logo de cara (o `env ... > FIFO`
+    # desbloqueia e o script começa a executar imediatamente), e só a
+    # LEITURA em si é adiada — isso enche o buffer do pipe e bloqueia o
+    # `cat <&11` real em write(), confirmado com o mesmo script de
+    # diagnóstico usando flock -n externo contra o lock do processo real.
+    READER_DELAY_S=3
+    RACE_FIFO="${TMP_DIR}/race.fifo"
+    rm -f "${RACE_FIFO}"
+    mkfifo "${RACE_FIFO}"
+    RACE_OUT="${TMP_DIR}/race.out"
+    : > "${RACE_OUT}"
     (
-        exec 9>"${LOCK_FILE}"
-        flock -s 9
-        : > "${HOLD_SENTINEL}"
-        while [[ ! -f "${RELEASE_SENTINEL}" ]]; do sleep 0.05; done
+        exec 30<"${RACE_FIFO}"
+        sleep "${READER_DELAY_S}"
+        cat <&30 > "${RACE_OUT}"
     ) &
-    HOLDER_PID=$!
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-        [[ -f "${HOLD_SENTINEL}" ]] && break
-        sleep 0.1
-    done
-    [[ -f "${HOLD_SENTINEL}" ]] || fail "holder do lock compartilhado não conseguiu segurar o lock a tempo (setup do teste)"
+    RACE_READER_PID=$!
+    env \
+        PATH="${MOCK_BIN}:${PATH}" \
+        RESTIC_ENV_FILE="${ENV_FILE}" \
+        RESTORE_LOG_FILE="${RESTORE_LOG}" \
+        RESTIC_RESTORE_ALLOW_NONROOT=1 \
+        "${RESTORE_COPY}" --hub-staging-download --job "${RACE_JOB}" --token "${TOKEN_RACE_GRANDE}" \
+        >"${RACE_FIFO}" 2>"${TMP_DIR}/race.err" &
+    RACE_DOWNLOAD_PID=$!
+    # Confirma que o processo de download está de fato vivo e ainda rodando
+    # (bloqueado em write(), buffer do pipe cheio, leitor ainda dormindo) no
+    # meio da janela de READER_DELAY_S — não apenas que ele iniciou.
+    sleep "$(awk "BEGIN { print ${READER_DELAY_S} / 2 }")"
+    kill -0 "${RACE_DOWNLOAD_PID}" 2>/dev/null \
+        || fail "staging-download real terminou cedo demais — não ficou bloqueado no FIFO sem leitura ativa (setup do teste de corrida)"
 
-    run_restore --hub-cleanup --job "${READY_JOB}"
-    [[ "${RUN_RC}" -ne 0 ]] || fail "cleanup não deveria remover staging com uma leitura (lock compartilhado) em andamento"
-    [[ -d "${ITEM_STAGING_DIR}/${READY_JOB}" ]] || fail "staging foi removido durante corrida com leitura ativa"
+    run_restore --hub-cleanup --job "${RACE_JOB}"
+    [[ "${RUN_RC}" -ne 0 ]] || fail "cleanup não deveria remover staging com um staging-download real em andamento"
+    [[ -d "${ITEM_STAGING_DIR}/${RACE_JOB}" ]] || fail "staging foi removido durante corrida com download real ativo"
+    # Confirma que o download ainda estava vivo DEPOIS da tentativa de
+    # cleanup também — se o cleanup tivesse (por hipótese de bug) matado ou
+    # corrompido o staging por baixo dele, o cat que já tinha o fd aberto
+    # teria morrido ou travado de forma anormal.
+    kill -0 "${RACE_DOWNLOAD_PID}" 2>/dev/null \
+        || fail "staging-download real morreu inesperadamente durante/após a tentativa de cleanup concorrente"
 
-    : > "${RELEASE_SENTINEL}"
-    wait "${HOLDER_PID}" 2>/dev/null || true
+    # Deixa o leitor (que acorda sozinho após READER_DELAY_S) drenar o FIFO
+    # e o download real terminar sozinho — não mata nada (cenário de sinal
+    # já é coberto isoladamente no 17; aqui o que importa é a janela de
+    # sobreposição com o cleanup).
+    wait "${RACE_DOWNLOAD_PID}" 2>/dev/null || true
+    wait "${RACE_READER_PID}" 2>/dev/null || true
+    rm -f "${RACE_FIFO}"
+    RACE_SHA_ORIGINAL="$(shasum -a 256 "${RACE_DATA}/grande.bin" 2>/dev/null | awk '{print $1}')"
+    [[ -n "${RACE_SHA_ORIGINAL}" ]] || RACE_SHA_ORIGINAL="$(sha256sum "${RACE_DATA}/grande.bin" | awk '{print $1}')"
+    RACE_SHA_RECEIVED="$(shasum -a 256 "${RACE_OUT}" 2>/dev/null | awk '{print $1}')"
+    [[ -n "${RACE_SHA_RECEIVED}" ]] || RACE_SHA_RECEIVED="$(sha256sum "${RACE_OUT}" | awk '{print $1}')"
+    assert_eq "${RACE_SHA_ORIGINAL}" "${RACE_SHA_RECEIVED}" \
+        "conteúdo transmitido durante a corrida com cleanup deve permanecer íntegro (sem truncar/corromper)"
 
-    run_restore --hub-cleanup --job "${READY_JOB}"
-    assert_eq "0" "${RUN_RC}" "cleanup após o leitor soltar o lock deve suceder"
-    [[ ! -d "${ITEM_STAGING_DIR}/${READY_JOB}" ]] || fail "cleanup não removeu o staging depois do lock liberado"
-    pass "cleanup concorrente com uma leitura ativa (lock compartilhado) é recusado; após liberar, cleanup sucede"
-
-    # Recria o job pronto de novo — os cenários acima consumiram-no.
-    write_meta "${READY_JOB}" "success" "${future}"
-    mkdir -p "${READY_DATA}"
-    printf 'conteudo pequeno' > "${READY_DATA}/pequeno.txt"
+    run_restore --hub-cleanup --job "${RACE_JOB}"
+    assert_eq "0" "${RUN_RC}" "cleanup após o download real terminar (lock liberado) deve suceder"
+    [[ ! -d "${ITEM_STAGING_DIR}/${RACE_JOB}" ]] || fail "cleanup não removeu o staging depois do download real terminar"
+    pass "cleanup concorrente com um staging-download REAL em andamento é recusado; após terminar, cleanup sucede"
 else
     echo "# aviso: 'flock' ausente neste sistema — pulando cenário de corrida cleanup-vs-leitura." >&2
 fi

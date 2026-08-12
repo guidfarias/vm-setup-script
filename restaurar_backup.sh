@@ -1574,29 +1574,32 @@ hub_decode_staging_token() {
 # ou falha se o meta.json não existe/não é JSON válido. status_word é só a
 # PRIMEIRA palavra do campo status (ex.: "failed algo" vira "failed") —
 # suficiente para diferenciar running/success/failed sem vazar o motivo.
-# SEMPRE spawna o mesmo processo Perl, mesmo quando meta.json não existe
-# (lê /dev/null nesse caso, o eval falha e cai no mesmo "exit 1" de um JSON
-# inválido) — mantém o custo de "job inexistente" e "job existente mas não
-# pronto" no mesmo caminho de código, para não abrir um canal de timing
-# observável entre os dois casos que hub_staging_job_ready mascara com a
-# mesma mensagem de erro.
+# SEMPRE spawna o mesmo processo Perl, e é o PRÓPRIO Perl (via open, não um
+# `[[ -f ]]` do bash antes de decidir o que ler) que descobre se meta.json
+# existe — sem branch prévio no chamador, "job inexistente" e "job existente
+# mas não pronto" percorrem exatamente o mesmo código nativo até o ponto em
+# que o arquivo é aberto ou não; só depois disso os dois casos podem
+# divergir minimamente (abrir+ler um arquivo real vs. abrir e falhar),
+# resíduo que não dá para eliminar sem também esconder do sistema de
+# arquivos se o meta existe, o que não é o objetivo aqui — o oráculo que
+# importa (a mensagem devolvida ao cliente) já é idêntica nos dois casos.
 hub_staging_job_state() {
-    local job_id="$1" meta input result
+    local job_id="$1" meta result
     meta="$(hub_item_meta_file "${job_id}")"
-    if [[ -f "${meta}" ]]; then
-        input="${meta}"
-    else
-        input="/dev/null"
-    fi
     result="$(perl -MJSON::PP -e '
-        local $/; my $d = eval { decode_json(<STDIN>) };
+        my ($path) = @ARGV;
+        my $d = eval {
+            open(my $fh, "<", $path) or die "open failed\n";
+            local $/;
+            decode_json(<$fh>);
+        };
         exit 1 if $@ || ref($d) ne "HASH";
         my $s = $d->{status} // "";
         $s =~ s/\s.*$//s;
         my $e = $d->{expires_at} // "";
         exit 1 if $s eq "" || $e !~ /^\d+$/;
         print "$s $e";
-    ' < "${input}" 2>/dev/null)" || return 1
+    ' "${meta}" 2>/dev/null)" || return 1
     [[ "${result}" =~ ^[^\ ]+\ [0-9]+$ ]] || return 1
     printf '%s' "${result}"
 }
@@ -1978,11 +1981,19 @@ run_hub_staging_list() {
 
     entries_tmp="$(mktemp)" || { hub_staging_close; exec 9<&-; hub_json_error "internal_error" "Falha ao preparar listagem."; return 1; }
     read_path="$(hub_staging_read_path)"
-    # find -maxdepth 1: só filhos diretos. "-print0" (portátil — funciona em
-    # GNU e BSD/macOS find; "-printf" é GNU-only) evita ambiguidade de nome
-    # com espaço/newline antes da leitura em bash; o tipo (d/f/l/outro) é
-    # decidido depois, por nó, com os testes -L/-d/-f do próprio bash.
-    if ! find "${read_path}" -mindepth 1 -maxdepth 1 -print0 > "${entries_tmp}" 2>/dev/null; then
+    # find -H: quando read_path é /proc/self/fd/<n> (ramo procfs de
+    # hub_staging_read_path), esse caminho É um symlink no Linux — sem -H,
+    # find NÃO o dereferencia por padrão e trata como um link folha (não
+    # desce nele), retornando lista VAZIA com rc=0 em vez de listar o
+    # diretório real. -H segue symlink só quando ele aparece na linha de
+    # comando (o argumento inicial), sem afetar links encontrados durante a
+    # travessia normal — continua seguro para o ramo de fallback por
+    # pathname, onde read_path já não é um link. -maxdepth 1: só filhos
+    # diretos. "-print0" (portátil — GNU e BSD/macOS; "-printf" é GNU-only)
+    # evita ambiguidade de nome com espaço/newline antes da leitura em bash;
+    # o tipo (d/f/l/outro) é decidido depois, por nó, com os testes
+    # -L/-d/-f do próprio bash.
+    if ! find -H "${read_path}" -mindepth 1 -maxdepth 1 -print0 > "${entries_tmp}" 2>/dev/null; then
         rm -f "${entries_tmp}"
         hub_staging_close; exec 9<&-
         hub_json_error "staging_read_failed" "Falha ao ler o staging do job."
@@ -2031,14 +2042,21 @@ run_hub_staging_list() {
 # Soma recursiva do tamanho em bytes de um caminho já resolvido no disco
 # local (arquivo ou diretório). Usado só para reportar metadados — nunca para
 # decidir se algo pode ser lido (isso é hub_staging_resolve).
+#
+# -H no du: mesmo motivo do find -H em run_hub_staging_list — quando path é
+# /proc/self/fd/<n> (ramo procfs de hub_staging_read_path), esse caminho É
+# um symlink no Linux; sem -H, du mede o link em si (poucos bytes), não a
+# árvore atrás dele. O ramo de arquivo (stat) já dereferencia naturalmente
+# (stat segue symlink por padrão), por isso só o ramo de diretório precisa
+# da flag.
 hub_staging_local_size() {
     local path="$1"
     if [[ -f "${path}" ]]; then
         stat -c '%s' "${path}" 2>/dev/null || stat -f '%z' "${path}" 2>/dev/null
         return
     fi
-    du -sk --apparent-size "${path}" 2>/dev/null | awk '{print $1 * 1024}' \
-        || du -sk "${path}" 2>/dev/null | awk '{print $1 * 1024}'
+    du -skH --apparent-size "${path}" 2>/dev/null | awk '{print $1 * 1024}' \
+        || du -skH "${path}" 2>/dev/null | awk '{print $1 * 1024}'
 }
 
 run_hub_staging_stat() {
@@ -2137,7 +2155,15 @@ run_hub_staging_download() {
         cat <&11 2>>"${RESTORE_LOG_FILE}"
         rc=$?
         hub_staging_close; exec 9<&-
-        HUB_STDOUT_IS_BINARY=false
+        # HUB_STDOUT_IS_BINARY permanece "true" — NÃO desligar aqui. cat já
+        # pode ter emitido bytes; desligar antes do return abre uma janela
+        # onde um TERM entre esta linha e o exit do chamador (main() faz
+        # `run_hub_staging_download ...; exit $?` logo em seguida, nunca
+        # mais toca stdout) veria a flag falsa e voltaria o trap ao ramo
+        # textual, anexando "Interrompido pelo usuário" ao artefato já
+        # emitido. Como nada depois deste ponto volta a escrever em stdout,
+        # não há necessidade de "religar" o modo texto — o processo só
+        # termina.
         return "${rc}"
     fi
 
@@ -2159,7 +2185,11 @@ run_hub_staging_download() {
     tar -C "${parent_dir}" -cf - -- "${base_name}" 2>>"${RESTORE_LOG_FILE}"
     rc=$?
     hub_staging_close; exec 9<&-
-    HUB_STDOUT_IS_BINARY=false
+    # Mesmo motivo do ramo de arquivo acima: NÃO desligar HUB_STDOUT_IS_BINARY
+    # aqui. tar já pode ter emitido bytes; o chamador (main()) só faz `exit`
+    # depois deste return, nunca mais escreve em stdout — não há janela
+    # segura para "religar" o modo texto, então ela permanece "true" até o
+    # processo terminar.
     return "${rc}"
 }
 
