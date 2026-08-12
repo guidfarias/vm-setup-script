@@ -102,6 +102,40 @@ run_restore() {
     RUN_RC=$?
 }
 
+# Chamada direta de --hub-restore-item (sem passar pelo wrapper): injeta um
+# --nonce fresco automaticamente, já que restic-restore.sh agora exige um.
+run_restore_item_direct() {
+    local nonce
+    nonce="$(openssl rand -hex 16)"
+    run_restore "$@" --nonce "${nonce}"
+}
+
+# Chama o hub-restore-shell de verdade via SSH_ORIGINAL_COMMAND — cobre o
+# handshake completo (nonce gerado pelo wrapper, comparação do marcador,
+# timeout/kill do filho) que uma chamada direta a --hub-restore-item não
+# exercita.
+run_wrapper() {
+    local original_command="$1"
+    : > "${OUT_FILE}"; : > "${ERR_FILE}"
+    env \
+        PATH="${MOCK_BIN}:${PATH}" \
+        SSH_ORIGINAL_COMMAND="${original_command}" \
+        RESTIC_ENV_FILE="${ENV_FILE}" \
+        RESTORE_LOG_FILE="${RESTORE_LOG}" \
+        RESTIC_RESTORE_ALLOW_NONROOT=1 \
+        MOCK_RESTIC_FAIL="${MOCK_RESTIC_FAIL:-}" \
+        MOCK_DF_MODE="${MOCK_DF_MODE:-normal}" \
+        MOCK_CALL_LOG="${CALL_LOG}" \
+        MOCK_DF_LOG="${DF_LOG}" \
+        MOCK_SUDO_LOG="${SUDO_LOG}" \
+        MOCK_LOGGER_LOG="${LOGGER_LOG}" \
+        MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
+        MOCK_MATCHED_LOG="${MATCHED_LOG}" \
+        MOCK_SIBLINGS_FILE="${SIBLINGS_FILE}" \
+        "${SHELL_COPY}" >"${OUT_FILE}" 2>"${ERR_FILE}"
+    RUN_RC=$?
+}
+
 require_command bash
 require_command openssl
 require_command perl
@@ -128,6 +162,16 @@ TEST_KEY_FILE="${TOKEN_KEY_FILE}" TEST_ITEM_DIR="${ITEM_STAGING_DIR}" TEST_LOCK_
         s{\Qreadonly HUB_ITEM_STAGING_DIR="/var/lib/hub-restore/items"\E}{$items};
         s{\Qreadonly HUB_ITEM_LOCK_FILE="/var/lib/hub-restore/.job.lock"\E}{$lock};
     ' "${RESTORE_COPY}"
+TEST_RESTORE_BIN="${RESTORE_COPY}" TEST_ITEM_DIR="${ITEM_STAGING_DIR}" \
+    perl -0pi -e '
+        my $restore = qq{readonly RESTORE_BIN="$ENV{TEST_RESTORE_BIN}"};
+        my $items = qq{readonly HUB_ITEM_STAGING_DIR="$ENV{TEST_ITEM_DIR}"};
+        s{\Qreadonly RESTORE_BIN="/usr/local/bin/restic-restore.sh"\E}{$restore};
+        s{\Qreadonly HUB_ITEM_STAGING_DIR="/var/lib/hub-restore/items"\E}{$items};
+        # Timeout de handshake reduzido só na cópia de teste (1s em vez de
+        # 8s) para o cenário de timeout não gastar tempo real em CI.
+        s{\Qreadonly HANDSHAKE_TIMEOUT_S=8\E}{readonly HANDSHAKE_TIMEOUT_S=1};
+    ' "${SHELL_COPY}"
 
 cat > "${ENV_FILE}" <<'ENV'
 AWS_ACCESS_KEY_ID='fixture-access'
@@ -238,7 +282,18 @@ cat > "${MOCK_BIN}/logger" <<'MOCK'
 printf 'logger argc=%d <%s>\n' "$#" "$*" >> "${MOCK_LOGGER_LOG}"
 MOCK
 
-chmod +x "${MOCK_BIN}/restic" "${MOCK_BIN}/df" "${MOCK_BIN}/logger"
+# sudo mockado: o wrapper roda "sudo -n RESTORE_BIN ...". Sem privilégio
+# real disponível no ambiente de teste, só remove o "-n" e executa o resto —
+# RESTIC_RESTORE_ALLOW_NONROOT=1 já faz o restic-restore.sh aceitar rodar
+# sem ser root.
+cat > "${MOCK_BIN}/sudo" <<'MOCK'
+#!/bin/bash
+printf 'sudo argc=%d <%s>\n' "$#" "$*" >> "${MOCK_SUDO_LOG:-/dev/null}"
+[[ "$1" == "-n" ]] && shift
+exec "$@"
+MOCK
+
+chmod +x "${MOCK_BIN}/restic" "${MOCK_BIN}/df" "${MOCK_BIN}/logger" "${MOCK_BIN}/sudo"
 
 # flock real é exigido (produção é sempre Linux/RunCloud). Se o sistema local
 # de teste não tiver util-linux (ex.: macOS), pula só os cenários que
@@ -256,50 +311,50 @@ TOKEN_A_QMARK="$(token_for_path "${SNAPSHOT}" '/a?txt')"
 
 if (( HAVE_FLOCK )); then
     # 1. Arquivo: materializa só o item, meta.json completo, staging isolado.
-    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-file-1
+    run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-file-1
     assert_eq "0" "${RUN_RC}" "restauração de arquivo"
-    [[ -f "${ITEM_STAGING_DIR}/job-file-1/meta.json" ]] || fail "meta.json ausente (arquivo)"
-    assert_eq "success" "$(json_field "${ITEM_STAGING_DIR}/job-file-1/meta.json" status)" "status final (arquivo)"
-    assert_eq "file" "$(json_field "${ITEM_STAGING_DIR}/job-file-1/meta.json" item_type)" "item_type (arquivo)"
-    assert_eq "/arquivo.txt" "$(json_field "${ITEM_STAGING_DIR}/job-file-1/meta.json" path)" "path persistido (arquivo)"
-    [[ "$(json_field "${ITEM_STAGING_DIR}/job-file-1/meta.json" expires_at)" -gt "$(json_field "${ITEM_STAGING_DIR}/job-file-1/meta.json" created_at)" ]] \
+    [[ -f "${ITEM_STAGING_DIR}/job-file-1/control/meta.json" ]] || fail "meta.json ausente (arquivo)"
+    assert_eq "success" "$(json_field "${ITEM_STAGING_DIR}/job-file-1/control/meta.json" status)" "status final (arquivo)"
+    assert_eq "file" "$(json_field "${ITEM_STAGING_DIR}/job-file-1/control/meta.json" item_type)" "item_type (arquivo)"
+    assert_eq "/arquivo.txt" "$(json_field "${ITEM_STAGING_DIR}/job-file-1/control/meta.json" path)" "path persistido (arquivo)"
+    [[ "$(json_field "${ITEM_STAGING_DIR}/job-file-1/control/meta.json" expires_at)" -gt "$(json_field "${ITEM_STAGING_DIR}/job-file-1/control/meta.json" created_at)" ]] \
         || fail "expires_at deve ser posterior a created_at"
     pass "restauração seletiva de arquivo materializa só o item em staging isolado"
 
     # 2. Diretório: mesmo fluxo, item_type=directory.
-    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_DIR}" --job job-dir-1
+    run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_DIR}" --job job-dir-1
     assert_eq "0" "${RUN_RC}" "restauração de diretório"
-    assert_eq "directory" "$(json_field "${ITEM_STAGING_DIR}/job-dir-1/meta.json" item_type)" "item_type (diretório)"
+    assert_eq "directory" "$(json_field "${ITEM_STAGING_DIR}/job-dir-1/control/meta.json" item_type)" "item_type (diretório)"
     [[ -d "${ITEM_STAGING_DIR}/job-dir-1" ]] || fail "staging do job-dir-1 ausente"
     [[ -d "${ITEM_STAGING_DIR}/job-file-1" ]] || fail "staging do job-file-1 deveria continuar existindo (isolado do job-dir-1)"
     pass "restauração seletiva de diretório usa staging isolado do job"
 
     # 3. Item ausente no snapshot: falha auditável, sem restic restore.
     : > "${CALL_LOG}"
-    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_MISSING}" --job job-missing-1
+    run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_MISSING}" --job job-missing-1
     assert_eq "1" "${RUN_RC}" "item ausente deve falhar"
-    assert_contains "${ITEM_STAGING_DIR}/job-missing-1/meta.json" '"status":"failed item' "meta de item ausente"
+    assert_contains "${ITEM_STAGING_DIR}/job-missing-1/control/meta.json" '"status":"failed item' "meta de item ausente"
     grep -q '^restic argc=[0-9]* <restore>' "${CALL_LOG}" && fail "não deveria chamar restic restore para item ausente"
     pass "item ausente no snapshot recusa e registra falha auditável, sem tentar restic restore"
 
     # 4. Pouco espaço: falha auditável antes do restic restore.
     : > "${CALL_LOG}"
-    MOCK_DF_MODE=low run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-lowspace-1
+    MOCK_DF_MODE=low run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-lowspace-1
     assert_eq "1" "${RUN_RC}" "pouco espaço deve falhar"
-    assert_contains "${ITEM_STAGING_DIR}/job-lowspace-1/meta.json" 'espaço livre insuficiente' "meta de pouco espaço"
+    assert_contains "${ITEM_STAGING_DIR}/job-lowspace-1/control/meta.json" 'espaço livre insuficiente' "meta de pouco espaço"
     grep -q '^restic argc=[0-9]* <restore>' "${CALL_LOG}" && fail "não deveria chamar restic restore com pouco espaço"
     pass "pouco espaço recusa a restauração antes de tocar o restic"
 
     # 5. Job duplicado: mesmo job_id não pode ser reaproveitado.
-    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-file-1
+    run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-file-1
     [[ "${RUN_RC}" -ne 0 ]] || fail "job_id repetido deveria ser recusado"
     assert_contains "${ERR_FILE}" "já existe" "mensagem de job duplicado"
     pass "segundo job com o mesmo job_id é recusado"
 
     # 6. Falha do Restic: status failed auditável, staging preservado para inspeção.
-    MOCK_RESTIC_FAIL=restore run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-resticfail-1
+    MOCK_RESTIC_FAIL=restore run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-resticfail-1
     assert_eq "1" "${RUN_RC}" "falha do restic deve propagar rc != 0"
-    assert_contains "${ITEM_STAGING_DIR}/job-resticfail-1/meta.json" '"status":"failed restic restore' "meta de falha do restic"
+    assert_contains "${ITEM_STAGING_DIR}/job-resticfail-1/control/meta.json" '"status":"failed restic restore' "meta de falha do restic"
     [[ -d "${ITEM_STAGING_DIR}/job-resticfail-1" ]] || fail "staging da falha deve ser preservado para auditoria"
     pass "falha do Restic termina em failed auditável, staging preservado"
 
@@ -307,10 +362,10 @@ if (( HAVE_FLOCK )); then
     # recebido pelo restic precisa ser o caminho ESCAPADO (literal), senão um
     # '*' ou '[...]' no nome real casaria outros itens do snapshot.
     : > "${INCLUDE_LOG}"
-    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_GLOB}" --job job-glob-1
+    run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_GLOB}" --job job-glob-1
     assert_eq "0" "${RUN_RC}" "restauração de item com metacaracteres de glob no nome"
-    assert_eq "file" "$(json_field "${ITEM_STAGING_DIR}/job-glob-1/meta.json" item_type)" "item_type (glob)"
-    assert_eq '/nome[esquisito]*.txt' "$(json_field "${ITEM_STAGING_DIR}/job-glob-1/meta.json" path)" "path persistido sem escape (glob)"
+    assert_eq "file" "$(json_field "${ITEM_STAGING_DIR}/job-glob-1/control/meta.json" item_type)" "item_type (glob)"
+    assert_eq '/nome[esquisito]*.txt' "$(json_field "${ITEM_STAGING_DIR}/job-glob-1/control/meta.json" path)" "path persistido sem escape (glob)"
     assert_contains "${INCLUDE_LOG}" '/nome\[esquisito\]\*.txt' "--include recebido pelo restic deve estar escapado"
     grep -qF '/nome[esquisito]*.txt' "${INCLUDE_LOG}" && fail "--include não pode chegar ao restic sem escape (viraria glob real)"
     pass "item com * ? [ ] no nome é passado ao restic como padrão literal (escapado), só o item exato é materializado"
@@ -321,7 +376,7 @@ if (( HAVE_FLOCK )); then
     # dois nomes reais do "snapshot" e prova que só o item pedido casa.
     printf '/a?txt\n/abtxt\n' > "${SIBLINGS_FILE}"
     : > "${MATCHED_LOG}"
-    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_A_QMARK}" --job job-glob-collision-1
+    run_restore_item_direct --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_A_QMARK}" --job job-glob-collision-1
     assert_eq "0" "${RUN_RC}" "restauração de /a?txt (colisão de glob)"
     [[ -s "${MATCHED_LOG}" ]] || fail "MATCHED_LOG vazio — mock de expansão de glob não rodou"
     assert_eq "1" "$(wc -l < "${MATCHED_LOG}" | tr -d ' ')" "exatamente 1 item deve casar o --include"
@@ -375,8 +430,8 @@ pass "--hub-cleanup recusa job_id fora do formato, sem aceitar caminho arbitrár
 # ocupado (simula um restore-item de fato em andamento) não pode ser
 # removido — nem por exclusão antecipada, nem pela varredura de expirados.
 if command -v flock >/dev/null 2>&1; then
-    mkdir -p "${ITEM_STAGING_DIR}/job-running-1"
-    cat > "${ITEM_STAGING_DIR}/job-running-1/meta.json" <<JSON
+    mkdir -p "${ITEM_STAGING_DIR}/job-running-1/control" "${ITEM_STAGING_DIR}/job-running-1/data"
+    cat > "${ITEM_STAGING_DIR}/job-running-1/control/meta.json" <<JSON
 {"version":1,"job_id":"job-running-1","snapshot":"${SNAPSHOT}","path":"/arquivo.txt","item_type":"file","status":"running","created_at":1,"expires_at":1}
 JSON
     # Segura o MESMO lock global que run_hub_restore_item usa, num processo em
@@ -446,13 +501,14 @@ if (( HAVE_FLOCK )); then
         MOCK_LOGGER_LOG="${LOGGER_LOG}" \
         MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
         "${RESTORE_COPY}" --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-envfail-2 \
+        --nonce "$(openssl rand -hex 16)" \
         >"${OUT_FILE}" 2>"${ERR_FILE}"
     RUN_RC=$?
     assert_eq "1" "${RUN_RC}" "falha de env deve retornar rc != 0"
-    [[ -f "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" ]] || fail "meta.json ausente após falha de env"
-    assert_contains "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" '"status":"failed env' "meta de falha de env"
-    grep -qF '"status":"running"' "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" \
-        && ! grep -qF '"status":"failed' "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" \
+    [[ -f "${ITEM_STAGING_DIR}/job-envfail-2/control/meta.json" ]] || fail "meta.json ausente após falha de env"
+    assert_contains "${ITEM_STAGING_DIR}/job-envfail-2/control/meta.json" '"status":"failed env' "meta de falha de env"
+    grep -qF '"status":"running"' "${ITEM_STAGING_DIR}/job-envfail-2/control/meta.json" \
+        && ! grep -qF '"status":"failed' "${ITEM_STAGING_DIR}/job-envfail-2/control/meta.json" \
         && fail "job de falha de env não pode ficar preso em running"
     pass "falha simulada de env deixa meta.json em failed, nunca preso em running"
 fi
@@ -474,13 +530,118 @@ if (( HAVE_FLOCK )); then
         MOCK_LOGGER_LOG="${LOGGER_LOG}" \
         MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
         "${RESTORE_COPY}" --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_DIR}" --job job-clientdrop-1 \
+        --nonce "$(openssl rand -hex 16)" \
         </dev/null >"${OUT_FILE}" 2>"${ERR_FILE}"
     RUN_RC=$?
     assert_eq "0" "${RUN_RC}" "job com stdin fechado (sessão caída) deve terminar normalmente"
-    assert_eq "success" "$(json_field "${ITEM_STAGING_DIR}/job-clientdrop-1/meta.json" status)" "status final (sessão caída)"
-    [[ "$(json_field "${ITEM_STAGING_DIR}/job-clientdrop-1/meta.json" finished_at)" -gt 0 ]] \
+    assert_eq "success" "$(json_field "${ITEM_STAGING_DIR}/job-clientdrop-1/control/meta.json" status)" "status final (sessão caída)"
+    [[ "$(json_field "${ITEM_STAGING_DIR}/job-clientdrop-1/control/meta.json" finished_at)" -gt 0 ]] \
         || fail "finished_at ausente/zero após conclusão"
     pass "job não depende de stdin/sessão viva — sobrevive à queda do cliente e termina auditável"
+fi
+
+# ---------------------------------------------------------------------------
+# Integração via hub-restore-shell (item 3, ciclo 3): cobre o handshake
+# COMPLETO — nonce gerado pelo wrapper, comparação do marcador, timeout/kill
+# do filho — que uma chamada direta a --hub-restore-item não exercita.
+# ---------------------------------------------------------------------------
+
+if (( HAVE_FLOCK )); then
+    # 16. Marcador fresco exigido: um .ready de uma tentativa ANTERIOR (nonce
+    # diferente) não pode fazer o wrapper aceitar a tentativa atual. Cria um
+    # job_dir com control/.ready contendo um nonce arbitrário, sem meta.json
+    # "running" real por trás — se o wrapper só checasse existência (bug do
+    # ciclo 2), aceitaria na hora; com a checagem de conteúdo, ele precisa
+    # esperar o job de verdade preparar (que vai gravar outro nonce) e só aí
+    # aceitar.
+    mkdir -p "${ITEM_STAGING_DIR}/job-staleready-1/control" "${ITEM_STAGING_DIR}/job-staleready-1/data"
+    printf 'nonce-de-uma-tentativa-anterior-que-nao-eh-esta' > "${ITEM_STAGING_DIR}/job-staleready-1/control/.ready"
+    # job_dir já existe → mkdir (sem -p) do run_hub_restore_item real vai
+    # falhar com EEXIST (job duplicado) — o que É o comportamento correto:
+    # mesmo com um .ready "válido" (existe) mas de conteúdo errado, o
+    # wrapper não pode aceitar. Confirma que a rejeição chega ao cliente,
+    # não um "ok" baseado no marcador obsoleto.
+    run_wrapper "restore-item ${SNAPSHOT} ${TOKEN_FILE} job-staleready-1"
+    [[ "${RUN_RC}" -ne 0 ]] || fail "marcador .ready de tentativa anterior não pode gerar 'ok' para um job_id reciclado sem preparação real"
+    assert_contains "${ERR_FILE}" "recusado" "rejeição de marcador obsoleto deve chegar ao cliente"
+    pass "marcador .ready de tentativa anterior (nonce diferente) não gera ok — job_id reciclado é sempre recusado até preparar de verdade"
+
+    # 17. Rejeição imediata de job duplicado via wrapper: job_id já usado com
+    # sucesso (job-dir-1, do bloco de chamada direta acima — não removido por
+    # nenhum teste anterior) deve ser recusado pelo wrapper com erro
+    # imediato, sem "ok" otimista.
+    run_wrapper "restore-item ${SNAPSHOT} ${TOKEN_DIR} job-dir-1"
+    [[ "${RUN_RC}" -ne 0 ]] || fail "wrapper não deveria responder ok para job_id já existente"
+    assert_contains "${ERR_FILE}" "recusado" "rejeição imediata de job duplicado via wrapper"
+    grep -qF '"ok":true' "${OUT_FILE}" && fail "wrapper não pode responder ok:true para job duplicado"
+    pass "wrapper rejeita job_id duplicado imediatamente via handshake, sem ok otimista"
+
+    # 18. Timeout de handshake mata o filho: RESTORE_BIN mockado para nunca
+    # gravar o marcador (dorme além do HANDSHAKE_TIMEOUT_S=1 reduzido nesta
+    # cópia de teste). O wrapper deve rejeitar E o processo/grupo não pode
+    # sobreviver à rejeição — testado verificando que o "job trava" (arquivo
+    # sentinela feito pelo mock DEPOIS do sleep) nunca aparece, provando que
+    # o processo foi morto antes de completar o sleep.
+    SLOW_SENTINEL="${TMP_DIR}/slow-restore-completed"
+    rm -f "${SLOW_SENTINEL}"
+    SLOW_RESTORE_BIN="${TMP_DIR}/restic-restore-slow.sh"
+    cat > "${SLOW_RESTORE_BIN}" <<SLOWMOCK
+#!/bin/bash
+sleep 5
+: > "${SLOW_SENTINEL}"
+SLOWMOCK
+    chmod +x "${SLOW_RESTORE_BIN}"
+    SLOW_SHELL_COPY="${TMP_DIR}/hub-restore-shell-slow"
+    cp "${SHELL_COPY}" "${SLOW_SHELL_COPY}"
+    TEST_SLOW_BIN="${SLOW_RESTORE_BIN}" perl -0pi -e '
+        my $restore = qq{readonly RESTORE_BIN="$ENV{TEST_SLOW_BIN}"};
+        s{\Qreadonly RESTORE_BIN="'"${RESTORE_COPY}"'"\E}{$restore};
+    ' "${SLOW_SHELL_COPY}"
+    START_TS=$(date +%s)
+    env \
+        PATH="${MOCK_BIN}:${PATH}" \
+        SSH_ORIGINAL_COMMAND="restore-item ${SNAPSHOT} ${TOKEN_FILE} job-timeout-1" \
+        RESTIC_ENV_FILE="${ENV_FILE}" \
+        RESTORE_LOG_FILE="${RESTORE_LOG}" \
+        RESTIC_RESTORE_ALLOW_NONROOT=1 \
+        MOCK_CALL_LOG="${CALL_LOG}" MOCK_DF_LOG="${DF_LOG}" MOCK_SUDO_LOG="${SUDO_LOG}" \
+        MOCK_LOGGER_LOG="${LOGGER_LOG}" \
+        "${SLOW_SHELL_COPY}" >"${OUT_FILE}" 2>"${ERR_FILE}"
+    RUN_RC=$?
+    ELAPSED=$(( $(date +%s) - START_TS ))
+    [[ "${RUN_RC}" -ne 0 ]] || fail "handshake sem marcador deveria terminar em rejeição (timeout)"
+    assert_contains "${ERR_FILE}" "recusado" "timeout de handshake deve rejeitar explicitamente"
+    (( ELAPSED < 5 )) || fail "wrapper esperou o sleep 5 inteiro — não matou o filho no timeout (levou ${ELAPSED}s)"
+    sleep 1
+    [[ ! -f "${SLOW_SENTINEL}" ]] || fail "processo lento completou o sleep 5 após o timeout — não foi morto (processo órfão)"
+    pass "timeout de handshake mata o processo/grupo do filho antes de rejeitar, sem deixá-lo órfão"
+
+    # 19. Fallback seletivo de status/log via wrapper: um job seletivo
+    # concluído (job-dir-1) deve responder a `status`/`log` mesmo não tendo
+    # NENHUM registro no protocolo legado (HUB_JOB_STATUS_DIR/HUB_JOB_LOG_DIR).
+    run_wrapper "status job-dir-1"
+    assert_eq "0" "${RUN_RC}" "status via wrapper para job seletivo"
+    assert_contains "${OUT_FILE}" '"status":"success"' "fallback de status deve ler o meta.json seletivo"
+    run_wrapper "log job-dir-1"
+    assert_eq "0" "${RUN_RC}" "log via wrapper para job seletivo"
+    pass "status/log via wrapper têm fallback para o job seletivo quando o protocolo legado não tem o job"
+
+    # 20. Remoção automática de running órfão expirado via wrapper/cleanup:
+    # job com status running e expires_at no passado (sem lock ativo — o
+    # dono morreu) deve ser removido por `cleanup` de varredura (chamada
+    # direta a --hub-cleanup, que é o que o cron roda; o wrapper só expõe
+    # exclusão antecipada por job_id, que corretamente NUNCA remove running).
+    mkdir -p "${ITEM_STAGING_DIR}/job-orphanrunning-1/control" "${ITEM_STAGING_DIR}/job-orphanrunning-1/data"
+    cat > "${ITEM_STAGING_DIR}/job-orphanrunning-1/control/meta.json" <<JSON
+{"version":1,"job_id":"job-orphanrunning-1","snapshot":"${SNAPSHOT}","path":"/arquivo.txt","item_type":"file","status":"running","created_at":1,"expires_at":1}
+JSON
+    run_restore --hub-cleanup
+    assert_eq "0" "${RUN_RC}" "varredura de cleanup com running órfão expirado"
+    [[ ! -d "${ITEM_STAGING_DIR}/job-orphanrunning-1" ]] \
+        || fail "job running órfão e expirado (sem lock ativo) deveria ter sido removido pela varredura"
+    pass "varredura de cleanup remove automaticamente job running órfão já expirado"
+else
+    echo "# aviso: 'flock' ausente neste sistema — pulando cenários 16-20 (integração via wrapper)." >&2
 fi
 
 echo "${PASS_COUNT} verificações OK."

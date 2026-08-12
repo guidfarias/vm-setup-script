@@ -20,16 +20,23 @@
 #   preflight <snapshot_id> <token> <file|directory>
 #                                    → valida item e espaço (JSON v1)
 #   restore-item <snapshot_id> <token> <job_id>
-#                                    → handshake síncrono curto (lock + job_dir
-#                                      + meta.json "running" confirmados pelo
-#                                      processo privilegiado); só então
-#                                      responde {"ok":true,"job_id":...} e
+#                                    → handshake síncrono curto vinculado a um
+#                                      nonce por tentativa: o processo
+#                                      privilegiado grava esse nonce no
+#                                      marcador SÓ depois de lock + job_dir +
+#                                      meta.json "running" confirmados; este
+#                                      wrapper compara o conteúdo do marcador
+#                                      contra o nonce gerado aqui (nunca
+#                                      aceita um marcador de outra tentativa).
+#                                      Só então responde {"ok":true,...} e
 #                                      desacopla (setsid) o Restic em si.
 #                                      Rejeição de spawn/sudo/lock/job
-#                                      duplicado vira erro IMEDIATO, não um
-#                                      "ok" otimista. SÓ o item do token,
-#                                      staging isolado por job, expira em 24h
-#                                      — issue #9. Acompanhe com status/log.
+#                                      duplicado vira erro IMEDIATO; timeout de
+#                                      handshake mata o grupo de processos do
+#                                      filho antes de rejeitar. SÓ o item do
+#                                      token, staging isolado por job (em
+#                                      control/ e data/ separados), expira em
+#                                      24h — issue #9. Acompanhe com status/log.
 #   cleanup <job_id>                 → sudo restic-restore.sh --hub-cleanup ...
 #                                      (exclusão antecipada do staging do job)
 #
@@ -96,7 +103,7 @@ case "${action}" in
         # de nomes de job_id não colidem na prática (o HUB escolhe), mas o
         # fallback cobre os dois sem exigir que o cliente saiba qual protocolo
         # criou o job.
-        item_meta="${HUB_ITEM_STAGING_DIR}/${job}/meta.json"
+        item_meta="${HUB_ITEM_STAGING_DIR}/${job}/control/meta.json"
         if [[ -f "${status_file}" ]]; then
             log_attempt "status job=${job} (legado)"
             cat -- "${status_file}"
@@ -112,7 +119,7 @@ case "${action}" in
         job="${parts[1]}"
         [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
         log_file="${HUB_JOB_LOG_DIR}/${job}.log"
-        item_log="${HUB_ITEM_STAGING_DIR}/${job}/job.log"
+        item_log="${HUB_ITEM_STAGING_DIR}/${job}/control/job.log"
         if [[ -f "${log_file}" ]]; then
             log_attempt "log job=${job} (legado)"
             cat -- "${log_file}"
@@ -155,30 +162,42 @@ case "${action}" in
         [[ "${snap}" =~ ${SNAPSHOT_RE} ]] || reject "snapshot_id inválido: ${snap}"
         [[ "${token}" =~ ${TOKEN_RE} ]]   || reject "token em formato inválido"
         [[ "${job}" =~ ${JOB_RE} ]]       || reject "job_id inválido: ${job}"
+        # Nonce imprevisível por TENTATIVA (não por job_id): o processo
+        # privilegiado só grava este valor no marcador depois de
+        # lock+job_dir+meta "running" garantidos (ver run_hub_restore_item).
+        # Sem isso, um .ready sobrevivente de uma tentativa anterior (mesmo
+        # job_id reciclado após cleanup, por exemplo) faria este wrapper
+        # aceitar sem que ESTA tentativa tenha de fato preparado nada.
+        nonce="$(openssl rand -hex 16 2>/dev/null)"
+        [[ "${nonce}" =~ ^[0-9a-f]{32}$ ]] || reject "falha ao gerar nonce de handshake"
         log_attempt "restore-item snapshot=${snap} job=${job}"
         # Desacoplado da sessão SSH de propósito: o Restic, uma vez iniciado,
         # não é cancelável, então fechar a conexão não pode derrubá-lo.
         # setsid cria uma nova sessão (imune a SIGHUP/SIGTERM do terminal que
-        # se desconectou); stdio vai só para dentro do sudo -n, que por sua
-        # vez tem RESTORE_LOG_FILE (job.log) como destino real via o próprio
+        # se desconectou) cujo PGID é o PID do próprio processo — usado
+        # abaixo para matar o grupo inteiro se o handshake der timeout.
+        # stdio vai só para dentro do sudo -n, que por sua vez tem
+        # RESTORE_LOG_FILE (job.log) como destino real via o próprio
         # restic-restore.sh.
         #
         # Handshake síncrono e curto ANTES de responder ao cliente: o
-        # processo privilegiado cria ${job_dir}/.ready assim que lock +
-        # job_dir + meta.json "running" estão garantidos (ver
-        # run_hub_restore_item). Só depois disso o wrapper responde "ok" —
-        # rejeição de spawn/sudo, lock ocupado ou job_id duplicado (EEXIST)
-        # vira erro IMEDIATO ao cliente, não um "ok" mentiroso. O Restic em
-        # si (a parte longa) continua rodando em background depois do
-        # handshake.
-        ready_file="${HUB_ITEM_STAGING_DIR}/${job}/.ready"
+        # processo privilegiado grava o nonce em ${job_dir}/control/.ready
+        # assim que lock + job_dir + meta.json "running" estão garantidos.
+        # Só depois disso, E só se o conteúdo do marcador bater exatamente
+        # com o nonce gerado aqui, o wrapper responde "ok" — rejeição de
+        # spawn/sudo, lock ocupado ou job_id duplicado (EEXIST) vira erro
+        # IMEDIATO ao cliente, não um "ok" mentiroso. O Restic em si (a
+        # parte longa) continua rodando em background depois do handshake.
+        ready_file="${HUB_ITEM_STAGING_DIR}/${job}/control/.ready"
+        used_setsid=0
         if command -v setsid >/dev/null 2>&1; then
+            used_setsid=1
             setsid sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
-                --token "${token}" --job "${job}" \
+                --token "${token}" --job "${job}" --nonce "${nonce}" \
                 </dev/null >/dev/null 2>&1 &
         else
             nohup sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
-                --token "${token}" --job "${job}" \
+                --token "${token}" --job "${job}" --nonce "${nonce}" \
                 </dev/null >/dev/null 2>&1 &
         fi
         child_pid=$!
@@ -186,8 +205,15 @@ case "${action}" in
         handshake_deadline=$(( $(date +%s) + HANDSHAKE_TIMEOUT_S ))
         while (( $(date +%s) < handshake_deadline )); do
             if [[ -f "${ready_file}" ]]; then
-                handshake_done=1
-                break
+                marker_content="$(cat -- "${ready_file}" 2>/dev/null || true)"
+                if [[ "${marker_content}" == "${nonce}" ]]; then
+                    handshake_done=1
+                    break
+                fi
+                # Marcador existe mas não é desta tentativa (nonce
+                # diferente) — pode ser sobra de um job_id reciclado ou
+                # ainda estar sendo escrito; segue tentando até o timeout ou
+                # o filho morrer, nunca aceita um marcador não confirmado.
             fi
             if ! kill -0 "${child_pid}" 2>/dev/null; then
                 # Processo morreu antes de preparar: captura o rc real (o
@@ -199,7 +225,32 @@ case "${action}" in
             sleep 0.1
         done
         if (( ! handshake_done )); then
-            reject "job ${job}: preparação não confirmou a tempo (${HANDSHAKE_TIMEOUT_S}s) — verifique status/log"
+            # Handshake não confirmou a tempo: mata o processo para não
+            # deixar um sudo/restic órfão preso tentando preparar um job que
+            # o cliente já vai considerar rejeitado. Espera a morte antes de
+            # responder, para o próximo restore-item deste job_id não
+            # colidir com um processo que ainda não liberou o lock.
+            #
+            # Com setsid, o PGID da nova sessão é igual ao PID do processo
+            # real (confirmado experimentalmente) — matar "-PGID" cobre
+            # qualquer filho que ele tenha bifurcado. SEM setsid (fallback
+            # nohup, ambiente sem util-linux), o processo NÃO ganha um PGID
+            # próprio: seu PGID é o do PRÓPRIO WRAPPER, então "kill -- -PID"
+            # aqui mataria o processo group inteiro do wrapper (perigoso, um
+            # kill -TERM -- "-$child_pid" com PGID errado pode até falhar
+            # silenciosamente ou atingir processos alheios) — nesse caso
+            # mata-se só o PID individual capturado.
+            if (( used_setsid )); then
+                kill -TERM -- "-${child_pid}" 2>/dev/null || true
+                sleep 0.3
+                kill -KILL -- "-${child_pid}" 2>/dev/null || true
+            else
+                kill -TERM "${child_pid}" 2>/dev/null || true
+                sleep 0.3
+                kill -KILL "${child_pid}" 2>/dev/null || true
+            fi
+            wait "${child_pid}" 2>/dev/null || true
+            reject "job ${job}: preparação não confirmou a tempo (${HANDSHAKE_TIMEOUT_S}s) — processo encerrado, tente novamente"
         fi
         disown "${child_pid}" 2>/dev/null || disown 2>/dev/null || true
         printf '{"version":1,"ok":true,"action":"restore-item","job_id":"%s"}\n' "${job}"

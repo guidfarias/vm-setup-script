@@ -455,13 +455,42 @@ cleanup <job_id>
 
 `restore-item` decodifica o `token` (o mesmo protocolo v1 de `list`/
 `preflight`) e materializa **somente aquele item** em
-`/var/lib/hub-restore/items/<job_id>/`, um diretório exclusivo por job. O
-`job_id` precisa ser único: reaproveitar um `job_id` existente é recusado.
+`/var/lib/hub-restore/items/<job_id>/`, um diretório exclusivo por job,
+dividido em dois subdiretórios:
+
+```text
+/var/lib/hub-restore/items/<job_id>/
+├── control/   meta.json, job.log, .ready — nunca no caminho do Restic
+└── data/      --target real do Restic (só o item restaurado)
+```
+
+Essa separação existe porque o item selecionado pode legitimamente ser um
+arquivo ou diretório raiz chamado `meta.json`, `job.log` ou `.ready` no
+snapshot original — sem `control/` e `data/` separados, restaurar esse item
+sobrescreveria os próprios controles do job.
+
+O `job_id` precisa ser único: reaproveitar um `job_id` existente é recusado.
 Só um job pode estar em execução por vez no servidor — o Restic, uma vez
 iniciado, não é cancelável, então um segundo `restore-item` concorrente é
 recusado com o job anterior intacto.
 
-Cada job grava um `meta.json` no seu diretório com a seleção, o estado e a
+**Handshake síncrono vinculado à tentativa.** `restore-item` não responde
+"ok" apenas por aceitar a chamada: o wrapper gera um nonce aleatório
+(`openssl rand -hex 16`) por tentativa e o repassa ao processo privilegiado
+via `--nonce`. O processo grava esse nonce em `control/.ready` **somente**
+depois que lock global, `job_dir` e `meta.json` com `status: "running"`
+estão garantidos — ou seja, depois que job duplicado (EEXIST), lock ocupado
+e token inválido já foram descartados. O wrapper espera até 8s por esse
+marcador e compara o **conteúdo** contra o nonce que ele mesmo gerou (nunca
+aceita um `.ready` de uma tentativa anterior, mesmo que o `job_id` tenha
+sido reciclado). Só com o nonce confirmado o wrapper responde
+`{"ok":true,"job_id":...}`; qualquer rejeição de spawn/sudo/lock/duplicado
+vira erro imediato, e um timeout de handshake mata o grupo de processos do
+filho antes de reportar erro ao cliente, evitando um `sudo`/Restic órfão
+tentando preparar um job que o cliente já vai considerar rejeitado. O Restic
+em si continua rodando em background depois do handshake confirmado.
+
+Cada job grava um `meta.json` em `control/` com a seleção, o estado e a
 expiração:
 
 ```json
@@ -474,27 +503,40 @@ expiração:
   "status": "success",
   "created_at": 1786550000,
   "expires_at": 1786636400,
-  "staging_dir": "/var/lib/hub-restore/items/abc123"
+  "staging_dir": "/var/lib/hub-restore/items/abc123/data"
 }
 ```
 
-`status` evolui de `running` para `success` ou `failed <motivo>`. Qualquer
-falha (item ausente, tipo incompatível, pouco espaço, erro do Restic) vira
-`failed` auditável no `meta.json` e no `job.log` do próprio diretório —
+`status` evolui de `running` para `success` ou `failed <motivo>`, e
+`finished_at` é gravado em toda transição final. Qualquer falha (item
+ausente, tipo incompatível, pouco espaço, erro do Restic) vira `failed`
+auditável no `meta.json` e no `control/job.log` do próprio diretório —
 nunca propaga um erro cru para quem chamou.
 
 A sessão SSH pode cair a qualquer momento: o job roda no servidor
 independente da conexão do HUB permanecer aberta, e termina em sucesso ou
-falha mesmo sem ninguém consultando o status.
+falha mesmo sem ninguém consultando o status. `status`/`log` no wrapper
+tentam primeiro o protocolo legado (`--non-interactive`) e, se o job_id não
+existir ali, buscam `control/meta.json`/`control/job.log` do job seletivo
+correspondente.
+
+**Espaço em diretórios.** O tamanho de um diretório vem 0 do próprio nó no
+Restic (ele não soma os filhos); `--hub-preflight` e `restore-item` somam o
+tamanho de todos os arquivos descendentes antes de decidir se há espaço —
+fail-closed se o cálculo não puder ser concluído.
 
 **Expiração e limpeza.** Cada job expira 24h após criado. `instalar_backup.sh`
 configura um cron dedicado (`/etc/cron.d/hub-restore-cleanup`, a cada 15min)
 que roda `restic-restore.sh --hub-cleanup` como root — idempotente: staging
 já removido não é erro, e um job sem `meta.json` legível (ex.: sessão caiu
-antes do primeiro write) expira pelo horário de criação do diretório. Exclusão
-antecipada usa `cleanup <job_id>` (wrapper) ou `--hub-cleanup --job <job_id>`
-(direto); a limpeza sempre reconstrói o caminho a partir do `job_id`
-validado por regex dentro do diretório fixo de staging — nunca aceita um
+antes do primeiro write) expira pelo horário de criação do diretório. Um job
+com `status: "running"` só é removido pela varredura de cron quando já
+passou de `expires_at` — nesse ponto, com o lock global em mãos, ele é
+necessariamente órfão (processo morto por crash, `SIGKILL` ou reboot antes
+de finalizar). Exclusão antecipada usa `cleanup <job_id>` (wrapper) ou
+`--hub-cleanup --job <job_id>` (direto) e nunca remove um job `running`,
+mesmo expirado — a limpeza sempre reconstrói o caminho a partir do `job_id`
+validado por regex dentro do diretório fixo de staging, nunca aceita um
 caminho arbitrário do chamador.
 
 O comando `restore` (snapshot inteiro) continua disponível durante o
