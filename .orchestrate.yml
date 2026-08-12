@@ -35,7 +35,7 @@ models:
       agent: codex
       family: openai
       model: gpt-5.6-luna
-      effort: medium
+      effort: max
     efficient_max:
       agent: codex
       family: openai
