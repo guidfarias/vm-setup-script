@@ -9,11 +9,19 @@
 # SSH_ORIGINAL_COMMAND. Só os 5 comandos abaixo são aceitos:
 #
 #   restore <snapshot_id> <job_id>   → sudo restic-restore.sh --non-interactive ...
+#                                      (snapshot INTEIRO; mantido durante o rollout
+#                                      da restauração seletiva, ver restore-item)
 #   status  <job_id>                 → imprime /var/lib/hub-restore/<job_id>.status
 #   log     <job_id>                 → imprime /var/log/hub-restore/<job_id>.log
 #   list <snapshot_id> [token]       → lista raiz ou um diretório (JSON v1)
 #   preflight <snapshot_id> <token> <file|directory>
 #                                    → valida item e espaço (JSON v1)
+#   restore-item <snapshot_id> <token> <job_id>
+#                                    → sudo restic-restore.sh --hub-restore-item ...
+#                                      (SÓ o item do token, staging isolado por
+#                                      job, expira em 24h — issue #9)
+#   cleanup <job_id>                 → sudo restic-restore.sh --hub-cleanup ...
+#                                      (exclusão antecipada do staging do job)
 #
 # Qualquer outra coisa (inclusive sessão vazia/interativa, comandos fora da
 # whitelist, ou snapshot_id/job_id fora do formato esperado) é recusada com
@@ -105,6 +113,24 @@ case "${action}" in
         log_attempt "preflight snapshot=${snap} type=${expected_type}"
         exec sudo -n "${RESTORE_BIN}" --hub-preflight --snapshot "${snap}" \
             --token "${token}" --expect-type "${expected_type}"
+        ;;
+    restore-item)
+        (( ${#parts[@]} == 4 )) \
+            || reject "uso: restore-item <snapshot_id> <token> <job_id> — recebido: ${cmd}"
+        snap="${parts[1]}"; token="${parts[2]}"; job="${parts[3]}"
+        [[ "${snap}" =~ ${SNAPSHOT_RE} ]] || reject "snapshot_id inválido: ${snap}"
+        [[ "${token}" =~ ${TOKEN_RE} ]]   || reject "token em formato inválido"
+        [[ "${job}" =~ ${JOB_RE} ]]       || reject "job_id inválido: ${job}"
+        log_attempt "restore-item snapshot=${snap} job=${job}"
+        exec sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
+            --token "${token}" --job "${job}"
+        ;;
+    cleanup)
+        (( ${#parts[@]} == 2 )) || reject "uso: cleanup <job_id> — recebido: ${cmd}"
+        job="${parts[1]}"
+        [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
+        log_attempt "cleanup job=${job}"
+        exec sudo -n "${RESTORE_BIN}" --hub-cleanup --job "${job}"
         ;;
     *)
         reject "comando fora da whitelist: ${cmd}"

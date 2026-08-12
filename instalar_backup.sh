@@ -60,6 +60,11 @@ CRON_LOG="/var/log/restic-cron.log"
 # Agendamento do cron: seg-sex às 02:30. Ajuste se quiser.
 CRON_SCHEDULE="30 2 * * 1-5"
 
+# Limpeza da restauração seletiva (issue #9): staging de item expira em 24h;
+# este cron roda --hub-cleanup a cada 15min para apagar o que já expirou.
+HUB_ITEM_CLEANUP_CRON_FILE="/etc/cron.d/hub-restore-cleanup"
+HUB_ITEM_CLEANUP_LOG="/var/log/hub-restore-cleanup.log"
+
 # Dias de retenção dos .tar.gz baixáveis (regra de lifecycle no S3).
 LIFECYCLE_DAYS="30"
 
@@ -388,6 +393,25 @@ EOF
     log_info "Cron configurado: '${CRON_SCHEDULE}' (seg-sex 02:30) → ${CRON_LOG}"
 }
 
+# Cron dedicado da limpeza de staging da restauração seletiva (issue #9).
+# Roda --hub-cleanup (sem --job) a cada 15min; idempotente, só apaga jobs já
+# expirados. Só é escrito se o restic-restore.sh foi instalado com sucesso.
+configure_hub_item_cleanup_cron() {
+    log_step "Configurando cron de limpeza da restauração seletiva em ${HUB_ITEM_CLEANUP_CRON_FILE}"
+    if [[ ! -x "${RESTORE_DEST}" ]]; then
+        log_warn "${RESTORE_DEST} ausente — pulando cron de limpeza da restauração seletiva."
+        return 0
+    fi
+    cat > "${HUB_ITEM_CLEANUP_CRON_FILE}" << EOF
+# Limpeza do staging de restauração seletiva (issue #9). Gerado por instalar_backup.sh.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+*/15 * * * * root ${RESTORE_DEST} --hub-cleanup >> ${HUB_ITEM_CLEANUP_LOG} 2>&1
+EOF
+    chmod 644 "${HUB_ITEM_CLEANUP_CRON_FILE}"
+    log_info "Cron de limpeza configurado: a cada 15min → ${HUB_ITEM_CLEANUP_LOG}"
+}
+
 # ---------------------------------------------------------------------------
 # 7. LIFECYCLE S3 (expira os .tar.gz baixáveis)
 # ---------------------------------------------------------------------------
@@ -642,6 +666,7 @@ main() {
     run_first_backup
     provision_hubrestore_user \
         || die "Provisionamento de ${HUBRESTORE_USER} falhou (wrapper hub-restore-shell não instalado)."
+    configure_hub_item_cleanup_cron
     print_final
 }
 

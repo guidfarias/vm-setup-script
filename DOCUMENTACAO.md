@@ -442,6 +442,64 @@ repositório e caminhos não são devolvidos. Os comandos só ficam disponíveis
 em um servidor depois que `instalar_backup.sh` atualizar o wrapper e criar a
 chave local — o protocolo anterior segue funcionando durante o rollout.
 
+### 6.0.2 — Restauração seletiva em staging isolado e expirável (issue #9)
+
+O modo `--non-interactive` original restaura o snapshot **inteiro**. Para
+restaurar só o item escolhido (arquivo, diretório, site ou banco) sem tocar
+produção, o wrapper aceita duas operações novas:
+
+```text
+restore-item <snapshot_id> <token> <job_id>
+cleanup <job_id>
+```
+
+`restore-item` decodifica o `token` (o mesmo protocolo v1 de `list`/
+`preflight`) e materializa **somente aquele item** em
+`/var/lib/hub-restore/items/<job_id>/`, um diretório exclusivo por job. O
+`job_id` precisa ser único: reaproveitar um `job_id` existente é recusado.
+Só um job pode estar em execução por vez no servidor — o Restic, uma vez
+iniciado, não é cancelável, então um segundo `restore-item` concorrente é
+recusado com o job anterior intacto.
+
+Cada job grava um `meta.json` no seu diretório com a seleção, o estado e a
+expiração:
+
+```json
+{
+  "version": 1,
+  "job_id": "abc123",
+  "snapshot": "01234567",
+  "path": "/home/site/wp-content",
+  "item_type": "directory",
+  "status": "success",
+  "created_at": 1786550000,
+  "expires_at": 1786636400,
+  "staging_dir": "/var/lib/hub-restore/items/abc123"
+}
+```
+
+`status` evolui de `running` para `success` ou `failed <motivo>`. Qualquer
+falha (item ausente, tipo incompatível, pouco espaço, erro do Restic) vira
+`failed` auditável no `meta.json` e no `job.log` do próprio diretório —
+nunca propaga um erro cru para quem chamou.
+
+A sessão SSH pode cair a qualquer momento: o job roda no servidor
+independente da conexão do HUB permanecer aberta, e termina em sucesso ou
+falha mesmo sem ninguém consultando o status.
+
+**Expiração e limpeza.** Cada job expira 24h após criado. `instalar_backup.sh`
+configura um cron dedicado (`/etc/cron.d/hub-restore-cleanup`, a cada 15min)
+que roda `restic-restore.sh --hub-cleanup` como root — idempotente: staging
+já removido não é erro, e um job sem `meta.json` legível (ex.: sessão caiu
+antes do primeiro write) expira pelo horário de criação do diretório. Exclusão
+antecipada usa `cleanup <job_id>` (wrapper) ou `--hub-cleanup --job <job_id>`
+(direto); a limpeza sempre reconstrói o caminho a partir do `job_id`
+validado por regex dentro do diretório fixo de staging — nunca aceita um
+caminho arbitrário do chamador.
+
+O comando `restore` (snapshot inteiro) continua disponível durante o
+rollout, que por ora se limita ao `onepage` sob teste supervisionado.
+
 ### 6.1 — Preparar o ambiente
 
 Com o wrapper `rr` (recomendado), **não é preciso preparar nada** — ele carrega as
