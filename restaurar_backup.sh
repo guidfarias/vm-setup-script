@@ -1350,6 +1350,23 @@ hub_make_token() {
     printf 'v1.%s.%s' "${payload}" "${mac}"
 }
 
+hub_constant_time_hex_equal() {
+    local left="$1" right="$2"
+    [[ "${left}" =~ ^[0-9a-f]{64}$ && "${right}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    perl -e '
+        use strict;
+        use warnings;
+
+        my ($left, $right) = @ARGV;
+        my $difference = 0;
+        for my $index (0 .. 63) {
+            $difference |= ord(substr($left, $index, 1))
+                ^ ord(substr($right, $index, 1));
+        }
+        exit($difference == 0 ? 0 : 1);
+    ' -- "${left}" "${right}" 2>/dev/null
+}
+
 # Define G_SELECTED com o caminho autenticado. O MAC é verificado antes de
 # decodificar e antes de qualquer chamada ao Restic.
 hub_decode_token() {
@@ -1359,7 +1376,7 @@ hub_decode_token() {
     supplied_mac="${BASH_REMATCH[2]}"
     (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
     expected_mac="$(hub_token_hmac "${snap}" "${payload}")" || return 1
-    [[ "${supplied_mac}" == "${expected_mac}" ]] || return 1
+    hub_constant_time_hex_equal "${supplied_mac}" "${expected_mac}" || return 1
     path="$(hub_base64url_decode "${payload}")" || return 1
     [[ -n "${path}" ]] || return 1
     hub_path_is_safe "${path}" || return 1
