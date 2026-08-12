@@ -298,6 +298,63 @@ FORCE_ARCHIVE=true /usr/local/bin/restic-backup.sh
 ps aux | grep -E 'restic-backup|restic|aws s3 cp|tar -czf' | grep -v grep
 ```
 
+### 5.7 — Relatório de monitoramento
+
+Ao final de cada backup normal, inclusive quando ele falha antes de concluir,
+o script grava o mesmo relatório JSON que tenta publicar no S3:
+
+```text
+Local: /var/log/restic-status.json
+S3:    s3://<S3_BUCKET>/Monitoramento/<host>.json
+```
+
+O arquivo local é escrito antes da tentativa de upload e é a fonte de auditoria
+quando AWS/S3 estiver indisponível. Para inspecioná-lo localmente:
+
+```bash
+sudo cat /var/log/restic-status.json
+# Se jq estiver instalado, formata e também valida a sintaxe JSON:
+sudo jq . /var/log/restic-status.json
+```
+
+#### Contrato público e compatibilidade
+
+`schema_version` é a versão inteira do contrato do relatório. A versão atual é
+`1`; um consumidor deve aceitar somente versões que conheça e tratar versão
+ausente, inválida ou futura como incompatível. A adição de campos opcionais não
+altera a versão, enquanto remoção, renomeação ou mudança de tipo de um campo
+obrigatório exige uma nova versão.
+
+| Campo | Tipo | Presença | Descrição |
+|---|---|---|---|
+| `schema_version` | inteiro | obrigatório | Versão do contrato público (`1`). |
+| `host` | string | obrigatório | Hostname curto do servidor. |
+| `status` | string | obrigatório | Resultado: `success`, `partial` ou `error`. |
+| `started_at`, `finished_at` | string | obrigatório | Timestamps ISO 8601 da execução. |
+| `duration_seconds` | inteiro ou `null` | obrigatório | Duração, ou `null` se não puder ser calculada. |
+| `databases` | objeto | obrigatório | Contadores inteiros `ok` e `failed`. |
+| `weekly_archive` | objeto | obrigatório | `ran` booleano e contadores inteiros `apps_ok` e `apps_failed`. |
+| `restic_snapshot_id`, `repo_size`, `snapshots_total` | string | obrigatório | Metadados do repositório; podem ser string vazia se indisponíveis. |
+| `snapshots` | array | opcional | Lista de snapshots quando a coleta Restic foi bem-sucedida. |
+| `check_ran` | booleano | obrigatório | Indica se o check de integridade foi executado. |
+| `errors` | array de strings | obrigatório | Avisos e falhas relevantes, com escape JSON. |
+| `script_version` | string | obrigatório | Versão do script que emitiu o relatório. |
+
+Cada item de `snapshots` expõe **somente** `short_id` (string), `time`
+(string) e `paths` (array de strings). Campos internos retornados por
+`restic snapshots --json` não fazem parte do contrato e nunca são publicados.
+Uma lista Restic vazia é representada por `"snapshots": []`; se a coleta ou o
+parse falhar, o campo é omitido e a causa é adicionada a `errors`, sem invalidar
+o restante do relatório.
+
+Os estados têm o seguinte significado:
+
+- `success`: a execução terminou sem erros registrados.
+- `partial`: a execução terminou, mas houve erro recuperável, como falha de
+  dump de um banco ou de um arquivo semanal.
+- `error`: a execução abortou; ainda assim o relatório disponível até esse
+  ponto é persistido para auditoria.
+
 ---
 
 ## 6. Restauração
