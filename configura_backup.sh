@@ -99,6 +99,10 @@ HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 STATUS_LOCAL_FILE="${STATUS_LOCAL_FILE:-/var/log/restic-status.json}"
 # Prefixo (pasta) no S3 onde os JSONs de status são gravados.
 STATUS_S3_PREFIX="${STATUS_S3_PREFIX:-Monitoramento}"
+# Versão do contrato público do relatório de monitoramento. Consumidores devem
+# aceitar apenas versões que conheçam para não interpretar silenciosamente um
+# formato incompatível.
+STATUS_SCHEMA_VERSION=1
 STATUS_SCRIPT_VERSION="2026-08"
 
 STATUS_STARTED_AT=""          # ISO8601 do início
@@ -833,16 +837,29 @@ build_snapshots_json() {
         return c == " " || c == "\t" || c == "\r" || c == "\n"
     }
 
-    function json_string_end(s, start,    j, c, escaped) {
+    function json_string_end(s, start,    j, c, escaped, hex) {
         escaped = 0
         for (j = start + 1; j <= length(s); j++) {
             c = substr(s, j, 1)
             if (escaped) {
+                if (c == "u") {
+                    hex = substr(s, j + 1, 4)
+                    if (length(hex) != 4 || hex ~ /[^0-9A-Fa-f]/) {
+                        return 0
+                    }
+                    j += 4
+                } else if (c != "\"" && c != "\\" && c != "/" \
+                           && c != "b" && c != "f" && c != "n" \
+                           && c != "r" && c != "t") {
+                    return 0
+                }
                 escaped = 0
             } else if (c == "\\") {
                 escaped = 1
             } else if (c == "\"") {
                 return j
+            } else if (c ~ /[[:cntrl:]]/) {
+                return 0
             }
         }
         return 0
@@ -915,6 +932,48 @@ build_snapshots_json() {
         for (i = 1; i <= input_length && !parse_error; i++) {
             c = substr(input, i, 1)
 
+            # Depois de fechar o array raiz, apenas espaço em branco é válido.
+            # Isso evita publicar uma redução aparentemente válida quando o
+            # comando restic devolve JSON seguido de conteúdo corrompido.
+            if (root_array_closed && !is_json_space(c)) {
+                parse_error = 1
+                break
+            }
+
+            # O array raiz deve conter somente objetos de snapshots separados
+            # por vírgula. Sem este estado, valores escalares eram ignorados e
+            # uma vírgula antes de ] era aceita como uma lista aparentemente
+            # vazia/válida.
+            if (curly_depth == 0 && array_depth == 1 && !is_json_space(c)) {
+                if (c == "{") {
+                    if (!root_expects_value) {
+                        parse_error = 1
+                        break
+                    }
+                    root_expects_value = 0
+                    root_after_comma = 0
+                } else if (c == ",") {
+                    if (root_expects_value) {
+                        parse_error = 1
+                        break
+                    }
+                    root_expects_value = 1
+                    root_after_comma = 1
+                    continue
+                } else if (c == "]") {
+                    if (root_expects_value && root_after_comma) {
+                        parse_error = 1
+                        break
+                    }
+                    array_depth--
+                    root_array_closed = 1
+                    continue
+                } else {
+                    parse_error = 1
+                    break
+                }
+            }
+
             if (c == "\"") {
                 end = json_string_end(input, i)
                 if (end == 0) {
@@ -975,10 +1034,16 @@ build_snapshots_json() {
 
             if (c == "[") {
                 array_depth++
+                if (array_depth == 1) {
+                    root_expects_value = 1
+                    root_after_comma = 0
+                }
             } else if (c == "]") {
                 array_depth--
                 if (array_depth < 0) {
                     parse_error = 1
+                } else if (array_depth == 0) {
+                    root_array_closed = 1
                 }
             } else if (c == "{") {
                 if (curly_depth == 0 && array_depth == 1) {
@@ -991,6 +1056,7 @@ build_snapshots_json() {
                 } else {
                     if (curly_depth == 1 && array_depth == 1) {
                         emit_snapshot()
+                        root_expects_value = 0
                     }
                     curly_depth--
                 }
@@ -1028,11 +1094,14 @@ collect_status_snapshots() {
 # STATUS JSON — grava o resultado do backup localmente e no S3
 # ---------------------------------------------------------------------------
 
-# Escapa uma string para uso seguro dentro de JSON (aspas, barra, controles).
+# Escapa uma string para uso seguro dentro de JSON (aspas, barra e controles
+# comuns que podem aparecer em mensagens de erro).
 json_escape() {
     local s="$1"
     s="${s//\\/\\\\}"   # barra invertida primeiro
     s="${s//\"/\\\"}"   # aspas
+    s="${s//$'\b'/\\b}"   # backspace
+    s="${s//$'\f'/\\f}"   # form feed
     s="${s//$'\t'/\\t}" # tab
     s="${s//$'\r'/\\r}" # CR
     s="${s//$'\n'/\\n}" # LF
@@ -1083,6 +1152,7 @@ write_status() {
     local json
     json="$(cat <<JSON
 {
+  "schema_version": ${STATUS_SCHEMA_VERSION},
   "host": "$(json_escape "${host}")",
   "status": "$(json_escape "${overall}")",
   "started_at": "$(json_escape "${started}")",
