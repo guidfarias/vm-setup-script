@@ -940,6 +940,40 @@ build_snapshots_json() {
                 break
             }
 
+            # O array raiz deve conter somente objetos de snapshots separados
+            # por vírgula. Sem este estado, valores escalares eram ignorados e
+            # uma vírgula antes de ] era aceita como uma lista aparentemente
+            # vazia/válida.
+            if (curly_depth == 0 && array_depth == 1 && !is_json_space(c)) {
+                if (c == "{") {
+                    if (!root_expects_value) {
+                        parse_error = 1
+                        break
+                    }
+                    root_expects_value = 0
+                    root_after_comma = 0
+                } else if (c == ",") {
+                    if (root_expects_value) {
+                        parse_error = 1
+                        break
+                    }
+                    root_expects_value = 1
+                    root_after_comma = 1
+                    continue
+                } else if (c == "]") {
+                    if (root_expects_value && root_after_comma) {
+                        parse_error = 1
+                        break
+                    }
+                    array_depth--
+                    root_array_closed = 1
+                    continue
+                } else {
+                    parse_error = 1
+                    break
+                }
+            }
+
             if (c == "\"") {
                 end = json_string_end(input, i)
                 if (end == 0) {
@@ -1000,6 +1034,10 @@ build_snapshots_json() {
 
             if (c == "[") {
                 array_depth++
+                if (array_depth == 1) {
+                    root_expects_value = 1
+                    root_after_comma = 0
+                }
             } else if (c == "]") {
                 array_depth--
                 if (array_depth < 0) {
@@ -1018,6 +1056,7 @@ build_snapshots_json() {
                 } else {
                     if (curly_depth == 1 && array_depth == 1) {
                         emit_snapshot()
+                        root_expects_value = 0
                     }
                     curly_depth--
                 }

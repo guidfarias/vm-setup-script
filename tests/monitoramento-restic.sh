@@ -6,7 +6,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_SCRIPT="${ROOT_DIR}/configura_backup.sh"
-JQ_BIN="$(command -v jq)"
+if ! JQ_BIN="$(command -v jq)"; then
+    echo "ERRO: jq é obrigatório para executar tests/monitoramento-restic.sh. Instale-o e tente novamente." >&2
+    exit 1
+fi
 TEST_TMP="$(mktemp -d)"
 MOCK_BIN="${TEST_TMP}/bin"
 SYSTEM_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
@@ -61,6 +64,12 @@ case "${1:-}" in
                 ;;
             snapshots-invalid)
                 printf '[{"short_id":"bad","time":"2026-08-12T00:00:00Z","paths":["/home"]}] conteudo-invalido\n'
+                ;;
+            snapshots-scalars)
+                printf '[1,2,3]\n'
+                ;;
+            snapshots-trailing-comma)
+                printf '[{"short_id":"bad","time":"2026-08-12T00:00:00Z","paths":["/home"]},]\n'
                 ;;
             *)
                 cat "${MOCK_SNAPSHOTS_FILE}"
@@ -212,6 +221,24 @@ assert_jq "${CASE_DIR}/status.json" '
 # JSON Restic inválido também não é repassado nem invalida o envelope público.
 run_case snapshots-invalid snapshots-invalid false
 [[ "${CASE_EXIT_CODE}" -eq 0 ]] || fail "snapshots-invalid: saída esperada 0, recebeu ${CASE_EXIT_CODE}"
+assert_jq "${CASE_DIR}/status.json" '
+  .schema_version == 1 and .status == "partial" and
+  (has("snapshots") | not) and
+  (.errors | any(contains("Falha ao processar snapshots restic para o status")))
+'
+
+# Elementos escalares e vírgula sobrando também são JSON estruturalmente inválido
+# para o contrato de snapshots e precisam ser descartados sem romper o envelope.
+run_case snapshots-scalars snapshots-scalars false
+[[ "${CASE_EXIT_CODE}" -eq 0 ]] || fail "snapshots-scalars: saída esperada 0, recebeu ${CASE_EXIT_CODE}"
+assert_jq "${CASE_DIR}/status.json" '
+  .schema_version == 1 and .status == "partial" and
+  (has("snapshots") | not) and
+  (.errors | any(contains("Falha ao processar snapshots restic para o status")))
+'
+
+run_case snapshots-trailing-comma snapshots-trailing-comma false
+[[ "${CASE_EXIT_CODE}" -eq 0 ]] || fail "snapshots-trailing-comma: saída esperada 0, recebeu ${CASE_EXIT_CODE}"
 assert_jq "${CASE_DIR}/status.json" '
   .schema_version == 1 and .status == "partial" and
   (has("snapshots") | not) and
