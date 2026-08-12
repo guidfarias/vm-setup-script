@@ -542,6 +542,113 @@ caminho arbitrário do chamador.
 O comando `restore` (snapshot inteiro) continua disponível durante o
 rollout, que por ora se limita ao `onepage` sob teste supervisionado.
 
+### 6.0.3 — Navegação e download do staging de um job concluído (issue #10)
+
+Depois que um `restore-item` termina com sucesso, o operador ainda
+precisaria de acesso SSH de verdade para inspecionar ou copiar o resultado.
+O wrapper aceita três operações novas, todas restritas ao `data/` do job:
+
+```text
+staging-list <job_id> [token]
+staging-stat <job_id> <token>
+staging-download <job_id> <token>
+```
+
+Só um job com `status: "success"` e ainda **dentro do prazo de 24h** expõe
+conteúdo. Job inexistente, `running`, `failed` ou expirado recebem o
+**mesmo** erro genérico (`job_not_ready`) — o cliente não aprende qual dos
+quatro é o caso real, o que evita usar a API como oráculo do estado interno
+do job.
+
+`staging-list` funciona como o `list` de navegação de snapshot, mas sobre o
+staging real em disco (`.../items/<job_id>/data/`) em vez do repositório
+Restic: sem token lista a raiz do item restaurado; com token, lista um
+subdiretório. A resposta JSON v1 tem no máximo 100 filhos diretos
+(`name`, `type`, `token`), com `truncated` quando o limite é atingido.
+Symlinks e tipos especiais nunca são listados — nem os internos ao staging,
+nem os que apontam para fora dele.
+
+`staging-stat` confirma tipo (`file`/`directory`) e tamanho em bytes de um
+item específico do staging, sem ler o conteúdo.
+
+Quando a leitura acontece pelo descritor já aberto (ver "Abertura por
+descritor" abaixo), o caminho passado a `find`/`du` é `/proc/self/fd/<n>` —
+um symlink no Linux. `find`/`du` **não** dereferenciam por padrão um symlink
+passado como argumento inicial; sem a flag `-H`, `staging-list` de um
+diretório retornaria uma listagem vazia (ao invés do conteúdo real) e
+`staging-stat` de um diretório mediria o link em si (poucos bytes) em vez da
+árvore. Por isso `find -H`/`du -H` são usados sempre que o caminho pode vir
+desse ramo — `-H` só afeta o argumento inicial da travessia, sem enfraquecer
+nenhuma outra proteção (symlinks encontrados durante a travessia continuam
+não seguidos).
+
+`staging-download` transmite o item em **stdout**: um arquivo vai cru (sem
+transformação, sem ser carregado inteiro em memória — o kernel faz o
+streaming via `cat`); um diretório é empacotado sob demanda como `tar`
+direto no stdout, nunca materializado num `.tar.gz` intermediário em disco.
+**Nenhum diagnóstico entra nesse stream**: qualquer mensagem de erro ou aviso
+vai só para stderr/log, nunca para stdout — o HUB pode gravar o stdout
+direto num arquivo sem risco de misturar texto de erro nos bytes binários.
+
+**Tokens são de um domínio diferente dos de navegação de snapshot.** O
+mesmo protocolo HMAC-SHA256 é reaproveitado (chave local em
+`/etc/restic/hub-token.key`), mas o prefixo é `v1s` (vs. `v1` da navegação
+de snapshot) e o MAC é calculado sobre `(job_id, caminho relativo dentro de
+data/)` em vez de `(snapshot, caminho do snapshot)`. Um token de um domínio
+nunca é aceito no outro, e um token assinado para um `job_id` nunca é aceito
+para outro job.
+
+**Confinamento ao staging do job.** Todo caminho recebido é resolvido com
+`realpath` (symlinks seguidos) e precisa continuar estritamente dentro do
+`data/` do job depois de resolvido — symlink apontando para fora (mesmo que
+interno ao próprio staging, apontando para outro arquivo dele), symlink em
+um componente **intermediário** do caminho (não só no nó final) e qualquer
+traversal são recusados antes de qualquer leitura. Essa é a segunda camada
+de defesa: a primeira já recusa `..`, `//` e caracteres de controle na forma
+textual do token, antes mesmo de tocar o disco.
+
+**Lock compartilhado contra corrida com o cleanup.** `staging-list`,
+`staging-stat` e `staging-download` seguram o mesmo lock global da
+restauração seletiva (issue #9), mas em modo **compartilhado**
+(`flock -s`) — vários leitores podem coexistir, porém nenhum coexiste com o
+lock **exclusivo** que `cleanup`/a varredura de expiração adquirem antes do
+`rm -rf`. O lock é mantido do início da validação até o fim da
+leitura/streaming; se não for possível obtê-lo em 5s (outro comando com o
+lock exclusivo em mãos), a operação é recusada (`staging_locked` ou erro em
+stderr, fail-closed) em vez de ler sem proteção. Isso fecha a corrida em que
+um `cleanup` concorrente apagaria ou truncaria o staging no meio de uma
+leitura em andamento.
+
+**Abertura por descritor, não por nome.** Depois de validar o caminho,
+`hub_staging_resolve` abre um descritor sobre o alvo e, em Linux (sempre no
+servidor de produção; verificado via `/proc/self/fd`), confirma que esse
+descritor aponta exatamente para o caminho já validado — fechando a janela
+entre a checagem e a abertura real. `staging-download` de um arquivo lê
+diretamente desse descritor (nunca reabre o caminho por nome). Empacotar um
+diretório como `tar` ainda precisa de um caminho (não de um descritor) para
+preservar o nome do item como diretório de topo do artefato; nesse caso a
+proteção é o lock compartilhado acima, que impede qualquer alteração
+concorrente do conteúdo enquanto o `tar` roda. Em plataformas sem
+`/proc/self/fd` (fora do alvo de produção), a verificação por descritor é
+pulada e a proteção fica só na validação de caminho e no lock.
+
+**Sinal durante o download não contamina o stream.** Um `TERM`/`INT`
+recebido enquanto `staging-download` está transmitindo não pode injetar
+texto (aviso de "interrompido") no meio dos bytes binários já em stdout — o
+trap de sinal do processo verifica um sinalizador interno (ligado no início
+de `run_hub_staging_download`) e, enquanto ativo, escreve exclusivamente em
+stderr/log. O sinalizador é desligado apenas nos caminhos de erro **antes**
+de qualquer byte de conteúdo ser emitido (validação de job/token/lock); a
+partir do momento em que `cat`/`tar` começa a escrever, ele permanece ligado
+até o processo terminar — nada depois disso volta a tocar stdout, então não
+há necessidade (nem seria seguro) de desligá-lo antes do fim.
+
+**Exclusão antecipada.** Não há um comando novo para isso — `cleanup
+<job_id>` (o mesmo do restore seletivo, issue #9) já remove o staging
+inteiro do job, incluindo o que `staging-download` exporia. Depois de
+removido, qualquer `staging-list`/`staging-stat`/`staging-download` para
+aquele `job_id` volta a falhar com `job_not_ready`.
+
 ### 6.1 — Preparar o ambiente
 
 Com o wrapper `rr` (recomendado), **não é preciso preparar nada** — ele carrega as

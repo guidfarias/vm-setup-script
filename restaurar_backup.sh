@@ -122,11 +122,22 @@ G_PATHS=(); G_TYPES=(); G_SIZES=()
 G_SELECTED=""
 G_ITEM_TYPE=""; G_ITEM_SIZE=""
 
+# Ligado só durante run_hub_staging_download, do início da validação até o
+# fim do cat/tar — enquanto ativo, stdout carrega SÓ bytes do conteúdo
+# (critério de aceite "logs e erros nunca entram no stream binário"). Os
+# handlers de EXIT/INT/TERM abaixo checam esta flag antes de qualquer echo
+# em stdout: um sinal recebido no meio do cat/tar não pode injetar texto no
+# meio dos bytes que já foram (ou estão sendo) escritos.
+HUB_STDOUT_IS_BINARY=false
+
 cleanup() {
     # Apaga SOMENTE os arquivos temporários de credenciais. O staging com o
     # material restaurado fica — ele é o produto da restauração.
     [[ -n "${MYSQL_DEFAULTS_FILE}" ]] && rm -f "${MYSQL_DEFAULTS_FILE}"
     [[ -n "${PGPASS_FILE}" ]]        && rm -f "${PGPASS_FILE}"
+    if [[ "${HUB_STDOUT_IS_BINARY}" == "true" ]]; then
+        return
+    fi
     if [[ -n "${STAGING_DIR}" && -d "${STAGING_DIR}" ]]; then
         echo
         echo "Arquivos restaurados/preventivos mantidos em: ${STAGING_DIR}"
@@ -134,7 +145,13 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-trap 'echo; warn "Interrompido pelo usuário."; exit 130' INT TERM
+trap '
+    if [[ "${HUB_STDOUT_IS_BINARY}" == "true" ]]; then
+        log_line "WARN" "Interrompido pelo usuário durante download de staging."
+        exit 130
+    fi
+    echo; warn "Interrompido pelo usuário."; exit 130
+' INT TERM
 
 # ---------------------------------------------------------------------------
 # LOG / SAÍDA
@@ -1495,6 +1512,194 @@ hub_decode_token() {
     G_SELECTED="${path}"
 }
 
+# ---------------------------------------------------------------------------
+# NAVEGAÇÃO/DOWNLOAD NO STAGING DE UM JOB CONCLUÍDO (issue #10)
+# ---------------------------------------------------------------------------
+# Mesmo protocolo de token do HUB (HMAC-SHA256, chave local), mas assinado
+# sobre (job_id, caminho relativo dentro de data/) em vez de (snapshot,
+# caminho do snapshot) — prefixo "v1s" (vs. "v1" da navegação de snapshot)
+# impede que um token de uma API seja reaproveitado na outra por engano ou
+# por um cliente malicioso.
+
+hub_staging_token_hmac() {
+    local job_id="$1" payload="$2" digest
+    hub_token_key >/dev/null || return 1
+    digest="$(printf 'v1s\0%s\0%s' "${job_id}" "${payload}" \
+        | HUB_HMAC_KEY_PATH="${HUB_TOKEN_KEY_FILE}" perl -MDigest::SHA=hmac_sha256_hex -e '
+            open my $fh, "<", $ENV{HUB_HMAC_KEY_PATH} or exit 1;
+            my $hex = <$fh>; close $fh; chomp $hex;
+            $hex =~ /^[0-9a-f]{64}$/ or exit 1;
+            binmode STDIN;
+            local $/;
+            my $data = <STDIN>;
+            print hmac_sha256_hex($data, pack("H*", $hex));
+        ' 2>/dev/null)" || return 1
+    [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "${digest}"
+}
+
+# rel_path já vem canônico ("/" = raiz de data/, ou "/sub/arquivo"), mesma
+# gramática de hub_path_is_safe usada na navegação de snapshot.
+hub_make_staging_token() {
+    local job_id="$1" rel_path="$2" payload mac
+    hub_path_is_safe "${rel_path}" || return 1
+    payload="$(printf '%s' "${rel_path}" | hub_base64url_encode)" || return 1
+    [[ "${payload}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
+    mac="$(hub_staging_token_hmac "${job_id}" "${payload}")" || return 1
+    printf 'v1s.%s.%s' "${payload}" "${mac}"
+}
+
+# Define G_SELECTED com o caminho relativo autenticado (dentro de data/ do
+# job_id informado). MAC verificado antes de decodificar e antes de tocar o
+# filesystem — o job_id faz parte do que é assinado, então um token de um job
+# nunca é aceito para outro.
+hub_decode_staging_token() {
+    local job_id="$1" token="$2" payload supplied_mac expected_mac rel_path canonical
+    [[ "${token}" =~ ^v1s\.([A-Za-z0-9_-]+)\.([0-9a-f]{64})$ ]] || return 1
+    payload="${BASH_REMATCH[1]}"
+    supplied_mac="${BASH_REMATCH[2]}"
+    (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
+    expected_mac="$(hub_staging_token_hmac "${job_id}" "${payload}")" || return 1
+    hub_constant_time_hex_equal "${supplied_mac}" "${expected_mac}" || return 1
+    rel_path="$(hub_base64url_decode "${payload}")" || return 1
+    [[ -n "${rel_path}" ]] || return 1
+    hub_path_is_safe "${rel_path}" || return 1
+    canonical="$(printf '%s' "${rel_path}" | hub_base64url_encode)" || return 1
+    [[ "${canonical}" == "${payload}" ]] || return 1
+    G_SELECTED="${rel_path}"
+}
+
+# Lê status/expires_at do meta.json de um job. Ecoa "<status_word> <expires_at>"
+# ou falha se o meta.json não existe/não é JSON válido. status_word é só a
+# PRIMEIRA palavra do campo status (ex.: "failed algo" vira "failed") —
+# suficiente para diferenciar running/success/failed sem vazar o motivo.
+# SEMPRE spawna o mesmo processo Perl, e é o PRÓPRIO Perl (via open, não um
+# `[[ -f ]]` do bash antes de decidir o que ler) que descobre se meta.json
+# existe — sem branch prévio no chamador, "job inexistente" e "job existente
+# mas não pronto" percorrem exatamente o mesmo código nativo até o ponto em
+# que o arquivo é aberto ou não; só depois disso os dois casos podem
+# divergir minimamente (abrir+ler um arquivo real vs. abrir e falhar),
+# resíduo que não dá para eliminar sem também esconder do sistema de
+# arquivos se o meta existe, o que não é o objetivo aqui — o oráculo que
+# importa (a mensagem devolvida ao cliente) já é idêntica nos dois casos.
+hub_staging_job_state() {
+    local job_id="$1" meta result
+    meta="$(hub_item_meta_file "${job_id}")"
+    result="$(perl -MJSON::PP -e '
+        my ($path) = @ARGV;
+        my $d = eval {
+            open(my $fh, "<", $path) or die "open failed\n";
+            local $/;
+            decode_json(<$fh>);
+        };
+        exit 1 if $@ || ref($d) ne "HASH";
+        my $s = $d->{status} // "";
+        $s =~ s/\s.*$//s;
+        my $e = $d->{expires_at} // "";
+        exit 1 if $s eq "" || $e !~ /^\d+$/;
+        print "$s $e";
+    ' "${meta}" 2>/dev/null)" || return 1
+    [[ "${result}" =~ ^[^\ ]+\ [0-9]+$ ]] || return 1
+    printf '%s' "${result}"
+}
+
+# Só jobs "success" e ainda dentro do prazo expõem conteúdo. Job inexistente,
+# running, failed ou expirado são todos recusados da mesma forma — o cliente
+# não aprende qual desses é o caso real (evita reconhecimento de estado
+# interno via oráculo de erro). SEMPRE chama `date` (mesmo quando o estado já
+# reprovou por status), pelo mesmo motivo de hub_staging_job_state: manter o
+# custo uniforme entre os casos reduz o canal de timing residual.
+hub_staging_job_ready() {
+    local job_id="$1" state status expires now ok
+    state="$(hub_staging_job_state "${job_id}")" || state="unknown 0"
+    read -r status expires <<< "${state}"
+    [[ "${status}" == "success" ]] && ok=0 || ok=1
+    now="$(date +%s)"
+    (( now < expires )) || ok=1
+    return "${ok}"
+}
+
+# Resolve <data_dir>/<rel_path> para um caminho REAL (realpath, symlinks
+# seguidos) e confirma que ele continua estritamente dentro de data_dir
+# resolvido. Recusa symlink apontando para fora, ".." e qualquer traversal
+# que o realpath exponha — hub_path_is_safe já bloqueia ".."/"//" na forma
+# textual do token, isto é a segunda camada, contra o conteúdo real do disco.
+#
+# TOCTOU: depois de validar o PATHNAME, esta função ABRE um descritor (fd 11)
+# sobre o alvo e, quando /proc/self/fd existe (Linux — sempre no servidor
+# alvo), confere que o fd aberto aponta exatamente para o mesmo caminho já
+# validado. Isso fecha a janela entre a checagem `-e`/`pwd -P` e a abertura
+# real: uma troca do nó por symlink nesse intervalo faria o fd resolver para
+# outro caminho, e a checagem abaixo recusa antes de qualquer leitura. Os
+# consumidores (list/stat/download) devem ler a PARTIR DESTE FD (arquivo:
+# `<&${STAGING_RESOLVED_FD}`; diretório: `/proc/self/fd/${STAGING_RESOLVED_FD}`
+# como -C do tar/alvo do find) em vez de reabrir STAGING_RESOLVED_PATH por
+# nome — reabrir por nome reintroduziria a mesma corrida que o fd fecha.
+# Em plataformas sem /proc/self/fd (ex.: BSD/macOS, usado só em teste/dev; a
+# produção é sempre Linux/RunCloud), a verificação do fd é pulada e o
+# caminho segue protegido apenas pela validação de pathname acima e pelo
+# lock compartilhado que o chamador deve segurar durante toda a leitura
+# (hub_item_acquire_lock_shared) — limitação residual documentada, não
+# fingida como resolvida.
+hub_staging_resolve() {
+    local data_dir="$1" rel_path="$2" base target resolved_base resolved_target
+    local fd_path
+    STAGING_RESOLVED_PATH=""; STAGING_RESOLVED_TYPE=""; STAGING_RESOLVED_FD=""
+    base="${data_dir}"
+    [[ -d "${base}" ]] || return 1
+    resolved_base="$(cd "${base}" 2>/dev/null && pwd -P)" || return 1
+    if [[ "${rel_path}" == "/" ]]; then
+        target="${resolved_base}"
+    else
+        target="${resolved_base}${rel_path}"
+    fi
+    # O nó final pode ser um symlink; não seguimos symlink no último
+    # componente para podermos recusar explicitamente (ver checagem abaixo)
+    # em vez de silenciosamente resolver para fora do staging.
+    if [[ -L "${target}" ]]; then
+        return 2
+    fi
+    [[ -e "${target}" ]] || return 1
+    resolved_target="$(cd "$(dirname -- "${target}")" 2>/dev/null && pwd -P)/$(basename -- "${target}")" \
+        || return 1
+    if [[ "${resolved_target}" != "${resolved_base}" && "${resolved_target}" != "${resolved_base}"/* ]]; then
+        return 1
+    fi
+    if [[ -d "${resolved_target}" ]]; then
+        STAGING_RESOLVED_TYPE="d"
+    elif [[ -f "${resolved_target}" ]]; then
+        STAGING_RESOLVED_TYPE="f"
+    else
+        return 2
+    fi
+
+    # Abre o fd ANTES de qualquer nova checagem: um open() sobre um symlink
+    # (sem O_NOFOLLOW disponível em bash puro) segue o link, então a defesa
+    # real é comparar, DEPOIS de aberto, para onde o fd de fato aponta.
+    exec 11<"${resolved_target}" 2>/dev/null || return 1
+    if [[ -d "/proc/self/fd" ]]; then
+        fd_path="$(readlink -f "/proc/self/fd/11" 2>/dev/null)" || { exec 11<&-; return 1; }
+        if [[ "${fd_path}" != "${resolved_target}" ]]; then
+            exec 11<&-
+            return 1
+        fi
+    fi
+
+    STAGING_RESOLVED_PATH="${resolved_target}"
+    STAGING_RESOLVED_FD=11
+    return 0
+}
+
+# Fecha o fd aberto por hub_staging_resolve. Chamada obrigatória por todo
+# consumidor após terminar de ler (sucesso ou falha) — um fd 11 esquecido
+# aberto vazaria entre chamadas dentro do mesmo processo (list/stat/download
+# são processos de vida curta, mas o hábito evita reuso acidental do fd).
+hub_staging_close() {
+    exec 11<&- 2>/dev/null || true
+    STAGING_RESOLVED_FD=""
+}
+
 # Carrega apenas o necessário para operações read-only do HUB, sem mensagens
 # interativas em stdout. Qualquer detalhe de credencial/repositório fica fora
 # da resposta JSON pública.
@@ -1711,6 +1916,283 @@ run_hub_preflight() {
         "${available_mb}" "${MIN_FREE_MB}" "${required_mb}" "${ready}"
 }
 
+# ---------------------------------------------------------------------------
+# NAVEGAÇÃO/METADADOS/DOWNLOAD DO STAGING DE UM JOB CONCLUÍDO (issue #10)
+# ---------------------------------------------------------------------------
+# Toda operação abaixo exige hub_staging_job_ready (status success, ainda
+# dentro do prazo) ANTES de decodificar o token ou tocar o filesystem — job
+# inexistente, running, failed ou expirado recebem o MESMO erro genérico
+# "job_not_ready", sem diferenciar o motivo real (evita oráculo de estado).
+
+hub_staging_prepare_job() {
+    local job_id="$1"
+    valid_job_id_selective "${job_id}" || { hub_json_error "invalid_job" "Identificador de job inválido."; return 1; }
+    hub_token_key >/dev/null || { hub_json_error "configuration_invalid" "Chave de tokens indisponível."; return 1; }
+    hub_staging_job_ready "${job_id}" || { hub_json_error "job_not_ready" "Job inexistente, ainda em execução, sem sucesso ou expirado."; return 1; }
+    return 0
+}
+
+# Caminho para ler o alvo já resolvido/aberto por hub_staging_resolve: usa
+# /proc/self/fd/<fd> quando disponível (Linux — sempre no servidor alvo),
+# senão cai para o pathname já validado (protegido pelo lock compartilhado
+# que o chamador está segurando durante toda a leitura).
+hub_staging_read_path() {
+    if [[ -n "${STAGING_RESOLVED_FD}" && -e "/proc/self/fd/${STAGING_RESOLVED_FD}" ]]; then
+        printf '/proc/self/fd/%s' "${STAGING_RESOLVED_FD}"
+    else
+        printf '%s' "${STAGING_RESOLVED_PATH}"
+    fi
+}
+
+run_hub_staging_list() {
+    local job_id="$1" token="${2:-}" data_dir rel_path="/" i name kind entry_token
+    local items="" count=0 truncated=false entries_tmp read_path
+
+    hub_staging_prepare_job "${job_id}" || return 1
+    if [[ -n "${token}" ]]; then
+        if ! hub_decode_staging_token "${job_id}" "${token}"; then
+            hub_json_error "invalid_token" "Token inválido."
+            return 1
+        fi
+        rel_path="${G_SELECTED}"
+    fi
+
+    data_dir="$(hub_item_data_dir "${job_id}")"
+
+    # Lock COMPARTILHADO do início da validação até o fim da leitura: exclui
+    # um cleanup concorrente (lock exclusivo) removendo o staging embaixo
+    # desta listagem. Timeout curto e fail-closed — se não conseguir o lock,
+    # recusa em vez de ler sem proteção.
+    if ! hub_item_acquire_lock_shared 9 5; then
+        hub_json_error "staging_locked" "Staging temporariamente indisponível, tente novamente."
+        return 1
+    fi
+
+    if ! hub_staging_resolve "${data_dir}" "${rel_path}"; then
+        exec 9<&-
+        hub_json_error "item_not_found" "Item não encontrado no staging do job."
+        return 1
+    fi
+    if [[ "${STAGING_RESOLVED_TYPE}" != "d" ]]; then
+        hub_staging_close; exec 9<&-
+        hub_json_error "not_a_directory" "O item não é um diretório."
+        return 1
+    fi
+
+    entries_tmp="$(mktemp)" || { hub_staging_close; exec 9<&-; hub_json_error "internal_error" "Falha ao preparar listagem."; return 1; }
+    read_path="$(hub_staging_read_path)"
+    # find -H: quando read_path é /proc/self/fd/<n> (ramo procfs de
+    # hub_staging_read_path), esse caminho É um symlink no Linux — sem -H,
+    # find NÃO o dereferencia por padrão e trata como um link folha (não
+    # desce nele), retornando lista VAZIA com rc=0 em vez de listar o
+    # diretório real. -H segue symlink só quando ele aparece na linha de
+    # comando (o argumento inicial), sem afetar links encontrados durante a
+    # travessia normal — continua seguro para o ramo de fallback por
+    # pathname, onde read_path já não é um link. -maxdepth 1: só filhos
+    # diretos. "-print0" (portátil — GNU e BSD/macOS; "-printf" é GNU-only)
+    # evita ambiguidade de nome com espaço/newline antes da leitura em bash;
+    # o tipo (d/f/l/outro) é decidido depois, por nó, com os testes
+    # -L/-d/-f do próprio bash.
+    if ! find -H "${read_path}" -mindepth 1 -maxdepth 1 -print0 > "${entries_tmp}" 2>/dev/null; then
+        rm -f "${entries_tmp}"
+        hub_staging_close; exec 9<&-
+        hub_json_error "staging_read_failed" "Falha ao ler o staging do job."
+        return 1
+    fi
+
+    while IFS= read -r -d '' child_path; do
+        name="$(basename -- "${child_path}")"
+        [[ ! "${name}" =~ [[:cntrl:]] ]] || continue
+        if [[ -L "${child_path}" ]]; then
+            continue  # symlink nunca é listado
+        elif [[ -d "${child_path}" ]]; then
+            kind="directory"
+        elif [[ -f "${child_path}" ]]; then
+            kind="file"
+        else
+            continue  # tipo especial (device, fifo, socket) nunca é listado
+        fi
+        if (( count >= HUB_NAV_LIMIT )); then
+            truncated=true
+            break
+        fi
+        local child_rel
+        if [[ "${rel_path}" == "/" ]]; then
+            child_rel="/${name}"
+        else
+            child_rel="${rel_path}/${name}"
+        fi
+        entry_token="$(hub_make_staging_token "${job_id}" "${child_rel}")" || {
+            rm -f "${entries_tmp}"
+            hub_staging_close; exec 9<&-
+            hub_json_error "token_generation_failed" "Falha ao proteger item do staging."
+            return 1
+        }
+        (( count > 0 )) && items+=","
+        items+="{\"name\":\"$(hub_json_escape "${name}")\",\"type\":\"${kind}\",\"token\":\"${entry_token}\"}"
+        ((count++))
+    done < "${entries_tmp}"
+    rm -f "${entries_tmp}"
+    hub_staging_close; exec 9<&-
+
+    printf '{"version":%d,"ok":true,"action":"staging-list","job_id":"%s","limit":%d,"truncated":%s,"items":[%s]}\n' \
+        "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "${HUB_NAV_LIMIT}" "${truncated}" "${items}"
+}
+
+# Soma recursiva do tamanho em bytes de um caminho já resolvido no disco
+# local (arquivo ou diretório). Usado só para reportar metadados — nunca para
+# decidir se algo pode ser lido (isso é hub_staging_resolve).
+#
+# -H no du: mesmo motivo do find -H em run_hub_staging_list — quando path é
+# /proc/self/fd/<n> (ramo procfs de hub_staging_read_path), esse caminho É
+# um symlink no Linux; sem -H, du mede o link em si (poucos bytes), não a
+# árvore atrás dele. O ramo de arquivo (stat) já dereferencia naturalmente
+# (stat segue symlink por padrão), por isso só o ramo de diretório precisa
+# da flag.
+hub_staging_local_size() {
+    local path="$1"
+    if [[ -f "${path}" ]]; then
+        stat -c '%s' "${path}" 2>/dev/null || stat -f '%z' "${path}" 2>/dev/null
+        return
+    fi
+    du -skH --apparent-size "${path}" 2>/dev/null | awk '{print $1 * 1024}' \
+        || du -skH "${path}" 2>/dev/null | awk '{print $1 * 1024}'
+}
+
+run_hub_staging_stat() {
+    local job_id="$1" token="$2" data_dir rel_path size_bytes kind read_path
+
+    hub_staging_prepare_job "${job_id}" || return 1
+    if ! hub_decode_staging_token "${job_id}" "${token}"; then
+        hub_json_error "invalid_token" "Token inválido."
+        return 1
+    fi
+    rel_path="${G_SELECTED}"
+    data_dir="$(hub_item_data_dir "${job_id}")"
+
+    # Mesmo lock compartilhado de run_hub_staging_list — ver comentário lá.
+    if ! hub_item_acquire_lock_shared 9 5; then
+        hub_json_error "staging_locked" "Staging temporariamente indisponível, tente novamente."
+        return 1
+    fi
+
+    if ! hub_staging_resolve "${data_dir}" "${rel_path}"; then
+        exec 9<&-
+        hub_json_error "item_not_found" "Item não encontrado no staging do job."
+        return 1
+    fi
+
+    [[ "${STAGING_RESOLVED_TYPE}" == "d" ]] && kind="directory" || kind="file"
+    read_path="$(hub_staging_read_path)"
+    size_bytes="$(hub_staging_local_size "${read_path}")"
+    hub_staging_close; exec 9<&-
+    [[ "${size_bytes}" =~ ^[0-9]+$ ]] || {
+        hub_json_error "size_check_failed" "Não foi possível calcular o tamanho do item."
+        return 1
+    }
+
+    printf '{"version":%d,"ok":true,"action":"staging-stat","job_id":"%s","item":{"type":"%s","token":"%s","size_bytes":%s}}\n' \
+        "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "${kind}" "${token}" "${size_bytes}"
+}
+
+# Transmite o conteúdo do item em stdout: arquivo cru, ou diretório
+# empacotado sob demanda como tar (stream, nunca materializado num .tar.gz
+# intermediário em disco — "empacotar de forma transitória" da issue).
+# QUALQUER diagnóstico vai para stderr/log; stdout carrega só bytes do
+# conteúdo, para o HUB poder gravar o stdout direto num arquivo sem risco de
+# misturar uma mensagem de erro no meio dos bytes binários.
+run_hub_staging_download() {
+    local job_id="$1" token="$2" data_dir rel_path rc
+
+    # A partir daqui, e até o fim desta função, stdout é reservado para
+    # bytes de conteúdo — o trap de EXIT/INT/TERM (topo do arquivo) checa
+    # esta flag antes de escrever qualquer texto em stdout, então um sinal
+    # recebido no meio do cat/tar não injeta aviso/erro no stream binário.
+    HUB_STDOUT_IS_BINARY=true
+
+    # Validação própria, SEM hub_json_error: essa função escreve JSON no
+    # stdout, o mesmo canal usado aqui para bytes binários — usá-la
+    # contaminaria o stream de download com uma mensagem de erro. Qualquer
+    # recusa neste comando vai só para stderr/log (via error()), nunca para
+    # stdout, mesmo em caso de falha.
+    valid_job_id_selective "${job_id}" || { error "job_id inválido."; HUB_STDOUT_IS_BINARY=false; return 1; }
+    hub_token_key >/dev/null 2>>"${RESTORE_LOG_FILE}" || { error "Chave de tokens indisponível."; HUB_STDOUT_IS_BINARY=false; return 1; }
+    if ! hub_staging_job_ready "${job_id}" 2>>"${RESTORE_LOG_FILE}"; then
+        error "Job inexistente, ainda em execução, sem sucesso ou expirado."
+        HUB_STDOUT_IS_BINARY=false
+        return 1
+    fi
+    if ! hub_decode_staging_token "${job_id}" "${token}" 2>>"${RESTORE_LOG_FILE}"; then
+        error "Token de download inválido (job ${job_id})."
+        HUB_STDOUT_IS_BINARY=false
+        return 1
+    fi
+    rel_path="${G_SELECTED}"
+    data_dir="$(hub_item_data_dir "${job_id}")"
+
+    # Lock COMPARTILHADO do início da validação até o fim do cat/tar — ver
+    # hub_item_acquire_lock_shared. Fail-closed: sem o lock, recusa em vez de
+    # transmitir sem proteção contra um cleanup concorrente.
+    if ! hub_item_acquire_lock_shared 9 5 2>>"${RESTORE_LOG_FILE}"; then
+        error "Staging temporariamente indisponível (lock ocupado), tente novamente."
+        HUB_STDOUT_IS_BINARY=false
+        return 1
+    fi
+
+    if ! hub_staging_resolve "${data_dir}" "${rel_path}" 2>>"${RESTORE_LOG_FILE}"; then
+        error "Item não encontrado no staging do job ${job_id}."
+        exec 9<&-
+        HUB_STDOUT_IS_BINARY=false
+        return 1
+    fi
+
+    if [[ "${STAGING_RESOLVED_TYPE}" == "f" ]]; then
+        # Lê DIRETO do fd já aberto e verificado por hub_staging_resolve
+        # (não reabre por nome — é exatamente essa reabertura que criaria a
+        # janela de TOCTOU). Sem transformação, sem carregar o arquivo
+        # inteiro em memória (kernel faz o streaming). Erros do próprio cat
+        # vão para stderr/log, nunca stdout.
+        cat <&11 2>>"${RESTORE_LOG_FILE}"
+        rc=$?
+        hub_staging_close; exec 9<&-
+        # HUB_STDOUT_IS_BINARY permanece "true" — NÃO desligar aqui. cat já
+        # pode ter emitido bytes; desligar antes do return abre uma janela
+        # onde um TERM entre esta linha e o exit do chamador (main() faz
+        # `run_hub_staging_download ...; exit $?` logo em seguida, nunca
+        # mais toca stdout) veria a flag falsa e voltaria o trap ao ramo
+        # textual, anexando "Interrompido pelo usuário" ao artefato já
+        # emitido. Como nada depois deste ponto volta a escrever em stdout,
+        # não há necessidade de "religar" o modo texto — o processo só
+        # termina.
+        return "${rc}"
+    fi
+
+    # Diretório: empacota como tar direto no stdout. -C entra no PAI do alvo
+    # e referencia só o nome final, então o tar contém um único diretório de
+    # topo com o nome do item (não o caminho absoluto do staging) — preserva
+    # esse nome porque bsdtar/GNU tar divergem na sintaxe de --transform/-s
+    # para renomear a partir de um -C baseado em /proc/self/fd, e introduzir
+    # esse ramo custaria mais risco do que resolve. A defesa contra reabrir
+    # um alvo trocado não é o fd aqui (tar precisa de um pathname), é o LOCK
+    # COMPARTILHADO seguro desde antes de hub_staging_resolve até aqui: um
+    # cleanup concorrente (lock exclusivo) não pode rodar `rm -rf`/recriar o
+    # job enquanto este lock estiver de pé, e nenhum outro comando allowlisted
+    # escreve em data/ de um job já concluído — só root, durante o próprio
+    # restore-item, antes do job existir para esta API.
+    local parent_dir base_name
+    parent_dir="$(dirname -- "${STAGING_RESOLVED_PATH}")"
+    base_name="$(basename -- "${STAGING_RESOLVED_PATH}")"
+    tar -C "${parent_dir}" -cf - -- "${base_name}" 2>>"${RESTORE_LOG_FILE}"
+    rc=$?
+    hub_staging_close; exec 9<&-
+    # Mesmo motivo do ramo de arquivo acima: NÃO desligar HUB_STDOUT_IS_BINARY
+    # aqui. tar já pode ter emitido bytes; o chamador (main()) só faz `exit`
+    # depois deste return, nunca mais escreve em stdout — não há janela
+    # segura para "religar" o modo texto, então ela permanece "true" até o
+    # processo terminar.
+    return "${rc}"
+}
+
 hub_job_log_file()    { echo "${HUB_JOB_LOG_DIR}/${1}.log"; }
 hub_job_status_file() { echo "${HUB_JOB_STATUS_DIR}/${1}.status"; }
 
@@ -1868,6 +2350,23 @@ hub_item_acquire_lock() {
     mkdir -p "$(dirname "${HUB_ITEM_LOCK_FILE}")" 2>/dev/null || true
     eval "exec ${fd}>\"\${HUB_ITEM_LOCK_FILE}\"" || return 1
     flock -n "${fd}"
+}
+
+# Variante COMPARTILHADA do mesmo lock global, usada pelos comandos de
+# leitura do staging (issue #10: staging-list/staging-stat/staging-download).
+# Múltiplos leitores podem segurar o lock ao mesmo tempo, mas nenhum deles
+# pode coexistir com o lock EXCLUSIVO que hub_item_remove_job adquire antes
+# do `rm -rf` — flock() do kernel garante essa exclusão mútua entre leitor(es)
+# e removedor, fechando a corrida em que um cleanup concorrente apagaria ou
+# truncaria o staging no meio de uma leitura/streaming. Bloqueante com
+# timeout curto (não indefinido): uma leitura não deve travar para sempre
+# esperando um cleanup que já terminou seu rm -rf rapidamente; se o timeout
+# estourar, quem chamou trata como falha (fail-closed, sem ler nada).
+hub_item_acquire_lock_shared() {
+    local fd="${1:-9}" timeout_s="${2:-5}"
+    mkdir -p "$(dirname "${HUB_ITEM_LOCK_FILE}")" 2>/dev/null || true
+    eval "exec ${fd}>\"\${HUB_ITEM_LOCK_FILE}\"" || return 1
+    flock -w "${timeout_s}" -s "${fd}"
 }
 
 # now_epoch/finalize_job_meta centralizam a transição final: toda saída do
@@ -2182,6 +2681,13 @@ Uso:
   sudo restic-restore.sh --hub-cleanup [--job <job_id>]
                                     # remove staging(s) de item expirado(s);
                                     # com --job, exclusão antecipada de um job
+  sudo restic-restore.sh --hub-staging-list --job <job_id> [--token <token>]
+  sudo restic-restore.sh --hub-staging-stat --job <job_id> --token <token>
+                                    # API JSON read-only; navega/inspeciona o
+                                    # staging JÁ CONCLUÍDO de um job (issue #10)
+  sudo restic-restore.sh --hub-staging-download --job <job_id> --token <token>
+                                    # transmite o item em stdout: arquivo cru
+                                    # ou diretório empacotado como tar
 
 O script carrega /etc/restic/env (o mesmo do backup), abre o repositório no
 S3 e oferece um menu para restaurar arquivos, sites e bancos de dados de
@@ -2225,6 +2731,15 @@ main() {
             --hub-cleanup)
                 [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
                 mode="hub-cleanup"; shift ;;
+            --hub-staging-list)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-staging-list"; shift ;;
+            --hub-staging-stat)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-staging-stat"; shift ;;
+            --hub-staging-download)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-staging-download"; shift ;;
             --snapshot)
                 [[ $# -ge 2 ]] || { echo "--snapshot exige um valor" >&2; exit 1; }
                 snap_arg="$2"; shift 2 ;;
@@ -2291,6 +2806,32 @@ main() {
             || { echo "--hub-cleanup só aceita --job" >&2; exit 1; }
         run_hub_cleanup "${job_arg}"
         return
+    fi
+
+    if [[ "${mode}" == "hub-staging-list" ]]; then
+        [[ -n "${job_arg}" ]] || { echo "--hub-staging-list exige --job <job_id>" >&2; exit 1; }
+        [[ -z "${snap_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
+        run_hub_staging_list "${job_arg}" "${token_arg}"
+        return
+    fi
+
+    if [[ "${mode}" == "hub-staging-stat" ]]; then
+        [[ -n "${job_arg}" && -n "${token_arg}" ]] \
+            || { echo "--hub-staging-stat exige --job <job_id> --token <token>" >&2; exit 1; }
+        [[ -z "${snap_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
+        run_hub_staging_stat "${job_arg}" "${token_arg}"
+        return
+    fi
+
+    if [[ "${mode}" == "hub-staging-download" ]]; then
+        [[ -n "${job_arg}" && -n "${token_arg}" ]] \
+            || { echo "--hub-staging-download exige --job <job_id> --token <token>" >&2; exit 1; }
+        [[ -z "${snap_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { echo "Argumentos inválidos para --hub-staging-download" >&2; exit 1; }
+        run_hub_staging_download "${job_arg}" "${token_arg}"
+        exit $?
     fi
 
     # Flags de modos remotos nunca são ignoradas no menu interativo.
