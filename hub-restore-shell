@@ -6,11 +6,14 @@
 # Configurado como "command=" no authorized_keys do usuário hubrestore
 # (ver instalar_backup.sh). Toda sessão SSH desse usuário roda ESTE script
 # em vez de um shell; o comando digitado pelo cliente chega em
-# SSH_ORIGINAL_COMMAND. Só os 3 comandos abaixo são aceitos:
+# SSH_ORIGINAL_COMMAND. Só os 5 comandos abaixo são aceitos:
 #
 #   restore <snapshot_id> <job_id>   → sudo restic-restore.sh --non-interactive ...
 #   status  <job_id>                 → imprime /var/lib/hub-restore/<job_id>.status
 #   log     <job_id>                 → imprime /var/log/hub-restore/<job_id>.log
+#   list <snapshot_id> [token]       → lista raiz ou um diretório (JSON v1)
+#   preflight <snapshot_id> <token> <file|directory>
+#                                    → valida item e espaço (JSON v1)
 #
 # Qualquer outra coisa (inclusive sessão vazia/interativa, comandos fora da
 # whitelist, ou snapshot_id/job_id fora do formato esperado) é recusada com
@@ -27,6 +30,7 @@ readonly HUB_JOB_STATUS_DIR="/var/lib/hub-restore"
 
 SNAPSHOT_RE='^[0-9a-f]{8,64}$'
 JOB_RE='^[A-Za-z0-9-]{1,64}$'
+TOKEN_RE='^v1\.[A-Za-z0-9_-]+\.[0-9a-f]{64}$'
 
 log_attempt() {
     logger -t hub-restore-shell -- "$*" 2>/dev/null || true
@@ -40,10 +44,11 @@ reject() {
 
 cmd="${SSH_ORIGINAL_COMMAND:-}"
 [[ -n "${cmd}" ]] || reject "sessão sem comando (shell vazio/interativo)"
+(( ${#cmd} <= 6000 )) || reject "comando excede o limite"
 
 # read -a só enxerga a 1ª linha — sem este check "status job<newline>lixo"
 # passaria despercebido em vez de ser recusado.
-[[ "${cmd}" == *$'\n'* ]] && reject "comando multi-linha: ${cmd}"
+[[ "${cmd}" == *$'\n'* || "${cmd}" == *$'\r'* ]] && reject "comando multi-linha"
 
 # Split simples: exatamente "ação arg1 [arg2]" — sem pipes, ;, &&, etc.
 read -r -a parts <<< "${cmd}"
@@ -75,6 +80,31 @@ case "${action}" in
         [[ -f "${log_file}" ]] || reject "log inexistente para job ${job}"
         log_attempt "log job=${job}"
         cat -- "${log_file}"
+        ;;
+    list)
+        (( ${#parts[@]} == 2 || ${#parts[@]} == 3 )) \
+            || reject "uso: list <snapshot_id> [token]"
+        snap="${parts[1]}"
+        [[ "${snap}" =~ ${SNAPSHOT_RE} ]] || reject "snapshot_id inválido"
+        log_attempt "list snapshot=${snap} token=$(( ${#parts[@]} == 3 ? 1 : 0 ))"
+        if (( ${#parts[@]} == 3 )); then
+            token="${parts[2]}"
+            [[ "${token}" =~ ${TOKEN_RE} ]] || reject "token em formato inválido"
+            exec sudo -n "${RESTORE_BIN}" --hub-list --snapshot "${snap}" --token "${token}"
+        fi
+        exec sudo -n "${RESTORE_BIN}" --hub-list --snapshot "${snap}"
+        ;;
+    preflight)
+        (( ${#parts[@]} == 4 )) \
+            || reject "uso: preflight <snapshot_id> <token> <file|directory>"
+        snap="${parts[1]}"; token="${parts[2]}"; expected_type="${parts[3]}"
+        [[ "${snap}" =~ ${SNAPSHOT_RE} ]] || reject "snapshot_id inválido"
+        [[ "${token}" =~ ${TOKEN_RE} ]] || reject "token em formato inválido"
+        [[ "${expected_type}" == "file" || "${expected_type}" == "directory" ]] \
+            || reject "tipo esperado inválido"
+        log_attempt "preflight snapshot=${snap} type=${expected_type}"
+        exec sudo -n "${RESTORE_BIN}" --hub-preflight --snapshot "${snap}" \
+            --token "${token}" --expect-type "${expected_type}"
         ;;
     *)
         reject "comando fora da whitelist: ${cmd}"

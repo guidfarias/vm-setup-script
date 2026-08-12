@@ -53,6 +53,7 @@ RESTORE_DEST="/usr/local/bin/restic-restore.sh"
 HUB_SHELL_DEST="/usr/local/bin/hub-restore-shell"
 ENV_DIR="/etc/restic"
 ENV_FILE="${ENV_DIR}/env"
+HUB_TOKEN_KEY_FILE="${ENV_DIR}/hub-token.key"
 CRON_FILE="/etc/cron.d/restic-backup"
 CRON_LOG="/var/log/restic-cron.log"
 
@@ -143,18 +144,24 @@ install_system_packages() {
 
     # Utilitários necessários → pacote que os fornece.
     # Para estes utilitários o nome do comando == nome do pacote no apt.
-    local util_cmds="gzip tar bzip2 unzip curl"
+    local util_cmds="gzip tar bzip2 unzip curl openssl perl"
     local missing=()
     local cmd
     for cmd in ${util_cmds}; do
         command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
     done
+    if command -v perl &>/dev/null \
+        && ! perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null; then
+        missing+=("perl")
+    fi
     # ca-certificates não tem um binário próprio; verifica pelo dpkg.
     if ! dpkg -s ca-certificates &>/dev/null; then
         missing+=("ca-certificates")
     fi
 
     if (( ${#missing[@]} == 0 )); then
+        perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+            || die "Módulos Perl de JSON/base64/SHA ausentes (necessários para navegação segura do HUB)."
         log_info "Todos os utilitários já presentes. Nenhuma instalação de pacote necessária."
         return 0
     fi
@@ -163,6 +170,8 @@ install_system_packages() {
     apt-get update -y || log_warn "apt-get update falhou (seguindo mesmo assim)."
     apt-get install -y "${missing[@]}" \
         || die "Falha ao instalar utilitários: ${missing[*]}"
+    perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+        || die "Módulos Perl de JSON/base64/SHA ausentes após instalar dependências."
     log_info "Utilitários instalados."
 }
 
@@ -461,6 +470,31 @@ run_first_backup() {
 # o usuário/sudoers são provisionados mesmo assim (privilégio mínimo pronto);
 # só o authorized_keys fica pendente até a chave ser informada.
 
+provision_hub_token_key() {
+    local key tmp
+    if [[ -f "${HUB_TOKEN_KEY_FILE}" ]]; then
+        key="$(cat -- "${HUB_TOKEN_KEY_FILE}")" || true
+        [[ "${key}" =~ ^[0-9a-f]{64}$ ]] \
+            || die "${HUB_TOKEN_KEY_FILE} existe, mas não contém uma chave válida de 32 bytes."
+        chmod 600 "${HUB_TOKEN_KEY_FILE}"
+        chown root:root "${HUB_TOKEN_KEY_FILE}"
+        log_info "Chave HMAC dos tokens do HUB já existe. Pulando geração."
+        return 0
+    fi
+
+    # Chave local, fora do transporte SSH e do env compartilhado do Restic.
+    # A escrita é atômica para nunca deixar um segredo parcial após interrupção.
+    tmp="$(mktemp "${ENV_DIR}/.hub-token.key.XXXXXX")"
+    if ! openssl rand -hex 32 > "${tmp}"; then
+        rm -f "${tmp}"
+        die "Falha ao gerar a chave HMAC dos tokens do HUB."
+    fi
+    chmod 600 "${tmp}"
+    chown root:root "${tmp}"
+    mv -f "${tmp}" "${HUB_TOKEN_KEY_FILE}"
+    log_info "Chave HMAC dos tokens do HUB criada em ${HUB_TOKEN_KEY_FILE}."
+}
+
 provision_hubrestore_user() {
     log_step "9/9 — Provisionando usuário ${HUBRESTORE_USER} (restauração remota HUB)"
 
@@ -472,6 +506,8 @@ provision_hubrestore_user() {
         log_error "Rode de novo (o instalador tenta baixar o wrapper de novo automaticamente)."
         return 1
     fi
+
+    provision_hub_token_key
 
     # Shell precisa ser um shell de verdade: o sshd invoca
     # "<shell> -c '<forced-command>'" para rodar o command= do
@@ -574,6 +610,7 @@ print_final() {
     echo -e "Cron:        ${CYAN}${CRON_FILE} (${CRON_SCHEDULE})${NC}"
     [[ -x "${RR_DEST}" ]] && echo -e "Wrapper:     ${CYAN}${RR_DEST}  (ex.: rr snapshots)${NC}"
     [[ -x "${RESTORE_DEST}" ]] && echo -e "Restauração: ${CYAN}sudo restic-restore.sh  (menu interativo)${NC}"
+    [[ -f "${HUB_TOKEN_KEY_FILE}" ]] && echo -e "HUB tokens:  ${CYAN}${HUB_TOKEN_KEY_FILE}${NC}"
     echo
 
     if [[ "${ENV_IS_TEMPLATE:-false}" == "true" ]]; then
