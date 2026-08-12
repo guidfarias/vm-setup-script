@@ -1,57 +1,71 @@
-name: Agent task
-description: Unidade de trabalho executável por um agente, sem contexto implícito.
+name: Tarefa de agente
+description: Unidade de trabalho executável sem contexto implícito.
 title: '<verbo no imperativo> <objeto específico>'
 labels: ['status:ready']
 body:
   - type: markdown
     attributes:
       value: |
-        **O issue é a fonte de verdade.** Antes de editar, o agente confirma o
-        plano e os arquivos previstos. Lacunas materiais voltam para decisão;
-        consequências diretas podem seguir com justificativa no PR.
-
-        Preencha os campos obrigatórios com concisão. O resto é opcional — use
-        somente quando fizer diferença para execução ou verificação.
-
-        Dependências não vão no corpo: use `Relationships → Mark as blocked by`.
+        **A issue é a fonte de verdade.** Decisões materiais de produto devem
+        estar aprovadas antes da criação. Dependências ficam em Relationships,
+        nunca apenas no corpo.
 
   - type: textarea
-    id: context
+    id: problem
     attributes:
-      label: Context
-      description: Qual é o problema e por que resolver agora.
+      label: Problema e motivo
+      description: O que está errado e por que precisa ser resolvido agora.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_cases
+    attributes:
+      label: Casos de uso
+      description: Momentos concretos em que este comportamento será usado.
     validations:
       required: true
 
   - type: textarea
     id: scope
     attributes:
-      label: Scope
-      description: O que este issue faz e qual o comportamento esperado depois do merge.
+      label: Escopo
+      description: O que este PR entrega.
     validations:
       required: true
 
   - type: textarea
     id: out_of_scope
     attributes:
-      label: Out of scope
-      description: O que explicitamente NÃO entra. É o campo mais barato e o que mais evita PR gigante.
+      label: Fora do escopo
+      description: O que explicitamente não entra neste PR.
     validations:
       required: true
 
   - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Comportamento esperado
+      description: Resultado observável depois do merge.
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical_details
+    attributes:
+      label: Detalhes técnicos relevantes
+      description: Contratos, módulos e decisões técnicas já aprovadas.
+
+  - type: textarea
     id: expected_files
     attributes:
-      label: Expected files
+      label: Módulos, funções e arquivos previstos
       description: >
-        Previsão não exaustiva após inspeção do repositório. Inclua testes e
-        marque arquivos novos. Testes, tipos, fixtures, snapshots, estilos e
-        imports/exports diretamente necessários podem ser adicionados com
-        justificativa no PR; contrato público, schema, dependência, autenticação,
-        permissão ou comportamento novo exigem decisão.
+        Previsão não exaustiva. Inclua código e testes. Consequências diretas
+        podem ser adicionadas com justificativa; contrato público, schema,
+        dependência, autenticação ou permissão exigem decisão.
       placeholder: |
         - caminho/do/arquivo.ext
-        - caminho/do/arquivo-novo.ext (novo)
         - caminho/do/teste.ext
     validations:
       required: true
@@ -59,14 +73,20 @@ body:
   - type: textarea
     id: acceptance
     attributes:
-      label: Acceptance criteria
-      description: >
-        Normalmente 6–10 resultados que uma máquina consegue responder sim ou
-        não. Permutações e casos de borda ficam em Test scenarios.
+      label: Critérios de aceite
+      description: Normalmente 6–10 resultados verificáveis.
       value: |
         - [ ]
         - [ ]
-        - [ ] O precommit e os testes afetados passam
+        - [ ] Precommit e testes afetados passam
+    validations:
+      required: true
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Cenários de teste
+      description: Casos normais, limites, erros e regressões relevantes.
     validations:
       required: true
 
@@ -74,25 +94,40 @@ body:
     id: points
     attributes:
       label: Points
-      description: >
-        Estima somente tamanho/esforço: 1 local, 2 pequeno, 3 não trivial, 5
-        amplo mas coeso. Não escolha pontos para comprar modelo; risco é separado.
+      description: Mede somente tamanho. Tickets acima de 5 devem ser quebrados.
       options: ['1', '2', '3', '5']
+    validations:
+      required: true
+
+  - type: dropdown
+    id: complexity
+    attributes:
+      label: Complexidade
+      options: [Local, Entre módulos, Arquitetural]
     validations:
       required: true
 
   - type: dropdown
     id: risk
     attributes:
-      label: Risk
-      description: >
-        Mede impacto e necessidade de julgamento, independentemente do tamanho.
-        Flagged inclui contrato público, persistência, mutação ou UX ambígua;
-        Critical inclui segurança, autorização, dados destrutivos ou rollout crítico.
-      options:
-        - Routine
-        - Flagged
-        - Critical
+      label: Risco
+      options: [Rotina, Elevado, Crítico]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: uncertainty
+    attributes:
+      label: Incerteza
+      options: [Baixa, Média, Alta]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: specialty
+    attributes:
+      label: Especialidade
+      options: [Geral, Elixir, Frontend, Dados, Infraestrutura, Segurança]
     validations:
       required: true
 
@@ -100,41 +135,28 @@ body:
     id: preview
     attributes:
       label: Preview
-      description: >
-        Required para mudança visual/interativa que precisa de localhost para
-        revisão humana. O worker apresenta o preview e para antes de commit/PR
-        até a aprovação visual; Not required para trabalho sem resultado visual.
       options:
-        - Not required
-        - Required
+        - Não necessário
+        - Servidor para QA
+        - Revisão humana
+    validations:
+      required: true
+
+  - type: dropdown
+    id: merge_policy
+    attributes:
+      label: Política de merge
+      options:
+        - Humano obrigatório
+        - Automático permitido
     validations:
       required: true
 
   - type: textarea
-    id: technical_details
-    attributes:
-      label: Technical details
-      description: >
-        Opcional. Decisões já tomadas, nomes de módulo/serviço, contratos.
-        Se este issue PRODUZ um contrato consumido por outro, escreva o contrato inteiro aqui.
-
-  - type: textarea
-    id: tests
-    attributes:
-      label: Test scenarios
-      description: Opcional, mas recomendado. Casos de borda que o agente pode não imaginar sozinho.
-
-  - type: textarea
     id: rollout
     attributes:
-      label: Rollout & kill switch
-      description: Opcional. Preencha quando houver risco — a flag nasce OFF.
-
-  - type: textarea
-    id: notes
-    attributes:
-      label: Outras notas
-      description: Opcional. Métricas, i18n, privacidade, o que for aplicável.
+      label: Rollout e kill switch
+      description: Preencha quando houver risco. A flag nasce desligada.
 
   - type: checkboxes
     id: gate
@@ -142,9 +164,8 @@ body:
       label: Antes de criar
       options:
         - label: >
-            Dependências estão em Relationships (se houver), isto cabe em UM PR
-            revisável, decisões materiais de produto/UX foram aprovadas e os
-            testes fazem parte deste ticket. Se Preview é Required, a label
-            preview:required foi aplicada e estados/viewports de revisão estão
-            descritos no Scope ou Acceptance criteria.
+            Decisões materiais foram aprovadas, testes pertencem a esta issue,
+            dependências estão em Relationships e o PR será revisável. Se houver
+            Revisão humana, apliquei preview:required. Se o merge automático for
+            permitido, apliquei merge:auto e confirmei que o risco é Rotina.
           required: true
