@@ -85,6 +85,12 @@ RESTORE_STAGING_BASE="${RESTORE_STAGING_BASE:-/tmp/restauracao}"
 # Limite de itens exibidos por diretório na navegação (diretórios gigantes).
 RESTORE_LS_LIMIT="${RESTORE_LS_LIMIT:-300}"
 
+# Protocolo JSON de navegação do HUB. Estes valores são deliberadamente fixos:
+# o cliente não escolhe limite, staging ou chave de autenticação dos tokens.
+readonly HUB_API_VERSION=1
+readonly HUB_NAV_LIMIT=100
+readonly HUB_TOKEN_KEY_FILE="/etc/restic/hub-token.key"
+
 # Modo não-interativo (disparado pelo HUB via hub-restore-shell). Caminhos
 # fixos de propósito — precisam bater exatamente com o que hub-restore-shell
 # lê; um override por ambiente aqui e não lá (ou vice-versa) quebra o wrapper.
@@ -105,8 +111,9 @@ PSQL_BIN="psql"; PG_DUMP_BIN="pg_dump"; PG_RESTORE_BIN="pg_restore"
 PG_BINS_RESOLVED=false
 
 # Resultados de funções (bash 3 não devolve arrays; usamos globais G_*)
-G_PATHS=(); G_TYPES=()
+G_PATHS=(); G_TYPES=(); G_SIZES=()
 G_SELECTED=""
+G_ITEM_TYPE=""; G_ITEM_SIZE=""
 
 cleanup() {
     # Apaga SOMENTE os arquivos temporários de credenciais. O staging com o
@@ -240,6 +247,9 @@ load_env_file() {
 
 validate_env() {
     command -v restic &>/dev/null || die "'restic' não encontrado. Rode o instalar_backup*.sh primeiro."
+    command -v openssl &>/dev/null || die "'openssl' não encontrado. Rode o instalar_backup*.sh primeiro."
+    perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+        || die "Módulos Perl necessários à navegação segura não estão disponíveis."
     [[ -n "${AWS_ACCESS_KEY_ID}" ]]     || die "AWS_ACCESS_KEY_ID não definido no env."
     [[ -n "${AWS_SECRET_ACCESS_KEY}" ]] || die "AWS_SECRET_ACCESS_KEY não definido no env."
     [[ -n "${RESTIC_PASSWORD}" ]]       || die "RESTIC_PASSWORD não definido no env."
@@ -313,32 +323,84 @@ menu_snapshots() {
 # LISTAGEM / NAVEGAÇÃO NO SNAPSHOT
 # ---------------------------------------------------------------------------
 
+# Converte o JSON Lines oficial de `restic ls --json` em registros internos
+# tipo<TAB>tamanho<TAB>caminho-base64url. O caminho continua codificado até
+# chegar ao Bash, impedindo que tabs/newlines de nomes virem novos registros.
+restic_ls_records() {
+    local snap="$1" path="$2" raw
+    raw="$(mktemp)" || return 1
+    if ! restic ls --json "${snap}" "${path}" >"${raw}" 2>>"${RESTORE_LOG_FILE}"; then
+        rm -f "${raw}"
+        return 1
+    fi
+    perl -MJSON::PP=decode_json -MMIME::Base64=encode_base64 -MEncode=encode_utf8 -e '
+        while (my $line = <>) {
+            my $entry = eval { decode_json($line) };
+            exit 2 if $@ || ref($entry) ne "HASH";
+            my $kind = $entry->{message_type} // $entry->{struct_type} // "";
+            next if $kind ne "node";
+            exit 2 if !defined($entry->{path}) || ref($entry->{path});
+            my $node_type = $entry->{type} // "";
+            my $type = $node_type eq "dir" ? "d"
+                : $node_type eq "file" ? "f"
+                : $node_type eq "symlink" ? "l" : "o";
+            my $size = $entry->{size} // 0;
+            exit 2 if $size !~ /^\d+$/;
+            my $encoded = encode_base64(encode_utf8($entry->{path}), "");
+            $encoded =~ tr!+/!-_!;
+            $encoded =~ s/=+$//;
+            print "$type\t$size\t$encoded\n";
+        }
+    ' "${raw}"
+    local rc=$?
+    rm -f "${raw}"
+    return "${rc}"
+}
+
+decode_restic_path() {
+    local encoded="$1" padded="${1//-/+}"
+    [[ "${encoded}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    padded="${padded//_/\/}"
+    case $(( ${#padded} % 4 )) in
+        0) ;;
+        2) padded+="==" ;;
+        3) padded+="=" ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "${padded}" | openssl base64 -A -d 2>/dev/null
+}
+
 # O caminho existe no snapshot? (a saída do `restic ls` lista caminhos com /)
 path_in_snapshot() {
     local snap="$1" path="$2"
     restic ls "${snap}" "${path}" 2>/dev/null | grep -q '^/'
 }
 
-# Lista UM nível de <dir> no snapshot. Preenche G_TYPES[i] (d=dir, f=outro)
-# e G_PATHS[i] (caminho absoluto). Limita a RESTORE_LS_LIMIT itens.
+# Lista UM nível de <dir> no snapshot. Preenche G_TYPES[i] (d=dir, f=file,
+# l=symlink, o=outro), G_PATHS[i] e G_SIZES[i]. O Restic é executado antes da
+# leitura dos resultados para que falhas não sejam confundidas com lista vazia.
 snap_ls_dir() {
-    local snap="$1" dir="$2"
-    G_PATHS=(); G_TYPES=()
-    local t p line
-    while IFS=$'\t' read -r t p; do
+    local snap="$1" dir="$2" limit="${3:-${RESTORE_LS_LIMIT}}"
+    G_PATHS=(); G_TYPES=(); G_SIZES=()
+    local records t size encoded p
+    records="$(mktemp)" || return 1
+    if ! restic_ls_records "${snap}" "${dir}" >"${records}"; then
+        rm -f "${records}"
+        return 1
+    fi
+    while IFS=$'\t' read -r t size encoded; do
+        p="$(decode_restic_path "${encoded}")" || continue
         [[ -z "${p}" || "${p}" == "${dir}" ]] && continue
+        [[ ! "${p}" =~ [[:cntrl:]] ]] || continue
+        # Defesa adicional: mesmo que uma versão/mock do Restic devolva
+        # descendentes, a API só expõe filhos cujo pai é exatamente <dir>.
+        [[ "$(dirname -- "${p}")" == "${dir}" ]] || continue
         G_TYPES+=("${t}")
+        G_SIZES+=("${size}")
         G_PATHS+=("${p}")
-        (( ${#G_PATHS[@]} >= RESTORE_LS_LIMIT )) && break
-    done < <(restic ls --long "${snap}" "${dir}" 2>>"${RESTORE_LOG_FILE}" \
-        | awk '
-            /^[a-z?-][rwxsStT?-]{9}[[:space:]]/ {
-                mode = substr($0, 1, 1)
-                line = $0
-                for (i = 0; i < 6; i++) sub(/^[^[:space:]]+[[:space:]]+/, "", line)
-                type = (mode == "d") ? "d" : "f"
-                print type "\t" line
-            }')
+        (( ${#G_PATHS[@]} >= limit )) && break
+    done < "${records}"
+    rm -f "${records}"
     return 0
 }
 
@@ -1204,6 +1266,293 @@ valid_snapshot_id() {
     [[ "$1" =~ ^[0-9a-f]{8,64}$ ]]
 }
 
+# ---------------------------------------------------------------------------
+# API JSON DE NAVEGAÇÃO / PREFLIGHT (HUB)
+# ---------------------------------------------------------------------------
+
+hub_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "${s}"
+}
+
+hub_json_error() {
+    local code="$1" message="$2"
+    printf '{"version":%d,"ok":false,"error":{"code":"%s","message":"%s"}}\n' \
+        "${HUB_API_VERSION}" "$(hub_json_escape "${code}")" "$(hub_json_escape "${message}")"
+    return 1
+}
+
+# Só aceita caminhos canônicos absolutos. Não normalizamos entrada hostil: um
+# token que contenha traversal, barras duplicadas ou controles é recusado.
+hub_path_is_safe() {
+    local path="$1"
+    (( ${#path} <= 4096 )) || return 1
+    [[ "${path}" == /* ]] || return 1
+    [[ "${path}" == "/" || "${path}" != */ ]] || return 1
+    [[ "${path}" != *//* ]] || return 1
+    [[ ! "${path}" =~ (^|/)\.{1,2}(/|$) ]] || return 1
+    [[ ! "${path}" =~ [[:cntrl:]] ]] || return 1
+}
+
+hub_token_key() {
+    local key
+    [[ -f "${HUB_TOKEN_KEY_FILE}" ]] || return 1
+    key="$(cat -- "${HUB_TOKEN_KEY_FILE}")" || return 1
+    [[ "${key}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "${key}"
+}
+
+hub_token_hmac() {
+    local snap="$1" payload="$2" digest
+    hub_token_key >/dev/null || return 1
+    digest="$(printf 'v1\0%s\0%s' "${snap}" "${payload}" \
+        | HUB_HMAC_KEY_PATH="${HUB_TOKEN_KEY_FILE}" perl -MDigest::SHA=hmac_sha256_hex -e '
+            open my $fh, "<", $ENV{HUB_HMAC_KEY_PATH} or exit 1;
+            my $hex = <$fh>; close $fh; chomp $hex;
+            $hex =~ /^[0-9a-f]{64}$/ or exit 1;
+            binmode STDIN;
+            local $/;
+            my $data = <STDIN>;
+            print hmac_sha256_hex($data, pack("H*", $hex));
+        ' 2>/dev/null)" || return 1
+    [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "${digest}"
+}
+
+hub_base64url_encode() {
+    openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '='
+}
+
+hub_base64url_decode() {
+    local payload="$1" padded="${1//-/+}"
+    padded="${padded//_/\/}"
+    case $(( ${#padded} % 4 )) in
+        0) ;;
+        2) padded+="==" ;;
+        3) padded+="=" ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "${padded}" | openssl base64 -A -d 2>/dev/null
+}
+
+hub_make_token() {
+    local snap="$1" path="$2" payload mac
+    hub_path_is_safe "${path}" || return 1
+    payload="$(printf '%s' "${path}" | hub_base64url_encode)" || return 1
+    [[ "${payload}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
+    mac="$(hub_token_hmac "${snap}" "${payload}")" || return 1
+    printf 'v1.%s.%s' "${payload}" "${mac}"
+}
+
+hub_constant_time_hex_equal() {
+    local left="$1" right="$2"
+    [[ "${left}" =~ ^[0-9a-f]{64}$ && "${right}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    perl -e '
+        use strict;
+        use warnings;
+
+        my ($left, $right) = @ARGV;
+        my $difference = 0;
+        for my $index (0 .. 63) {
+            $difference |= ord(substr($left, $index, 1))
+                ^ ord(substr($right, $index, 1));
+        }
+        exit($difference == 0 ? 0 : 1);
+    ' -- "${left}" "${right}" 2>/dev/null
+}
+
+# Define G_SELECTED com o caminho autenticado. O MAC é verificado antes de
+# decodificar e antes de qualquer chamada ao Restic.
+hub_decode_token() {
+    local snap="$1" token="$2" payload supplied_mac expected_mac path canonical
+    [[ "${token}" =~ ^v1\.([A-Za-z0-9_-]+)\.([0-9a-f]{64})$ ]] || return 1
+    payload="${BASH_REMATCH[1]}"
+    supplied_mac="${BASH_REMATCH[2]}"
+    (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
+    expected_mac="$(hub_token_hmac "${snap}" "${payload}")" || return 1
+    hub_constant_time_hex_equal "${supplied_mac}" "${expected_mac}" || return 1
+    path="$(hub_base64url_decode "${payload}")" || return 1
+    [[ -n "${path}" ]] || return 1
+    hub_path_is_safe "${path}" || return 1
+    canonical="$(printf '%s' "${path}" | hub_base64url_encode)" || return 1
+    [[ "${canonical}" == "${payload}" ]] || return 1
+    G_SELECTED="${path}"
+}
+
+# Carrega apenas o necessário para operações read-only do HUB, sem mensagens
+# interativas em stdout. Qualquer detalhe de credencial/repositório fica fora
+# da resposta JSON pública.
+hub_api_prepare() {
+    local perms
+    [[ $EUID -eq 0 || "${RESTIC_RESTORE_ALLOW_NONROOT:-0}" == "1" ]] \
+        || { hub_json_error "not_authorized" "Operação não autorizada."; return 1; }
+    command -v restic &>/dev/null \
+        || { hub_json_error "dependency_unavailable" "Serviço de snapshots indisponível."; return 1; }
+    command -v openssl &>/dev/null \
+        || { hub_json_error "dependency_unavailable" "Serviço de tokens indisponível."; return 1; }
+    perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+        || { hub_json_error "dependency_unavailable" "Serviço de tokens indisponível."; return 1; }
+    [[ -f "${RESTIC_ENV_FILE}" ]] \
+        || { hub_json_error "configuration_unavailable" "Configuração de backup indisponível."; return 1; }
+    perms="$(stat -c '%a' "${RESTIC_ENV_FILE}" 2>/dev/null \
+        || stat -f '%Lp' "${RESTIC_ENV_FILE}" 2>/dev/null || true)"
+    [[ "${perms}" == "600" || "${perms}" == "400" ]] \
+        || { hub_json_error "configuration_invalid" "Configuração de backup inválida."; return 1; }
+
+    # shellcheck source=/dev/null
+    source "${RESTIC_ENV_FILE}" >/dev/null 2>&1 \
+        || { hub_json_error "configuration_invalid" "Configuração de backup inválida."; return 1; }
+    [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" \
+        && -n "${RESTIC_PASSWORD:-}" && -n "${S3_BUCKET:-}" ]] \
+        || { hub_json_error "configuration_invalid" "Configuração de backup inválida."; return 1; }
+    [[ "${MIN_FREE_MB}" =~ ^[0-9]+$ && ${#MIN_FREE_MB} -le 9 ]] \
+        || { hub_json_error "configuration_invalid" "Configuração de backup inválida."; return 1; }
+    hub_token_key >/dev/null \
+        || { hub_json_error "configuration_invalid" "Chave de tokens indisponível."; return 1; }
+    export_restic_env
+    restic cat config >/dev/null 2>>"${RESTORE_LOG_FILE}" \
+        || { hub_json_error "repository_unavailable" "Repositório de snapshots indisponível."; return 1; }
+}
+
+hub_snapshot_exists() {
+    local snap="$1"
+    restic snapshots "${snap}" >/dev/null 2>>"${RESTORE_LOG_FILE}"
+}
+
+# Consulta exata do item. Define G_ITEM_TYPE e G_ITEM_SIZE; symlinks e tipos
+# especiais permanecem distintos e nunca são aceitos como arquivo.
+hub_get_item() {
+    local snap="$1" wanted="$2" records t size encoded path
+    G_ITEM_TYPE=""; G_ITEM_SIZE=""
+    records="$(mktemp)" || return 1
+    if ! restic_ls_records "${snap}" "${wanted}" >"${records}"; then
+        rm -f "${records}"
+        return 1
+    fi
+    while IFS=$'\t' read -r t size encoded; do
+        path="$(decode_restic_path "${encoded}")" || continue
+        [[ "${path}" == "${wanted}" ]] || continue
+        G_ITEM_TYPE="${t}"
+        G_ITEM_SIZE="${size}"
+        break
+    done < "${records}"
+    rm -f "${records}"
+    [[ -n "${G_ITEM_TYPE}" && "${G_ITEM_SIZE}" =~ ^[0-9]+$ && ${#G_ITEM_SIZE} -le 18 ]]
+}
+
+run_hub_list() {
+    local snap="$1" token="${2:-}" dir="/" i path type name item_token
+    local items="" count=0 truncated=false
+
+    if [[ -n "${token}" ]]; then
+        if ! hub_decode_token "${snap}" "${token}"; then
+            hub_json_error "invalid_token" "Token inválido."
+            return 1
+        fi
+        dir="${G_SELECTED}"
+    fi
+    if ! hub_api_prepare; then return 1; fi
+    if ! hub_snapshot_exists "${snap}"; then
+        hub_json_error "snapshot_not_found" "Snapshot não encontrado."
+        return 1
+    fi
+    if [[ "${dir}" != "/" ]]; then
+        if ! hub_get_item "${snap}" "${dir}"; then
+            hub_json_error "item_not_found" "Item não encontrado no snapshot."
+            return 1
+        fi
+        [[ "${G_ITEM_TYPE}" == "d" ]] || {
+            hub_json_error "not_a_directory" "O item não é um diretório."
+            return 1
+        }
+    fi
+    if ! snap_ls_dir "${snap}" "${dir}" "$((HUB_NAV_LIMIT + 1))"; then
+        hub_json_error "snapshot_read_failed" "Falha ao ler o snapshot."
+        return 1
+    fi
+    (( ${#G_PATHS[@]} > HUB_NAV_LIMIT )) && truncated=true
+
+    for i in "${!G_PATHS[@]}"; do
+        path="${G_PATHS[$i]}"; type="${G_TYPES[$i]}"
+        # Symlinks, devices e outros tipos especiais não recebem token e não
+        # podem entrar em nenhum fluxo posterior.
+        [[ "${type}" == "d" || "${type}" == "f" ]] || continue
+        hub_path_is_safe "${path}" || continue
+        name="$(basename -- "${path}")"
+        [[ ! "${name}" =~ [[:cntrl:]] ]] || continue
+        if (( count >= HUB_NAV_LIMIT )); then
+            truncated=true
+            break
+        fi
+        item_token="$(hub_make_token "${snap}" "${path}")" || {
+            hub_json_error "token_generation_failed" "Falha ao proteger item do snapshot."
+            return 1
+        }
+        (( count > 0 )) && items+=","
+        [[ "${type}" == "d" ]] && type="directory" || type="file"
+        items+="{\"name\":\"$(hub_json_escape "${name}")\",\"type\":\"${type}\",\"token\":\"${item_token}\"}"
+        ((count++))
+    done
+    printf '{"version":%d,"ok":true,"action":"list","snapshot":"%s","limit":%d,"truncated":%s,"items":[%s]}\n' \
+        "${HUB_API_VERSION}" "${snap}" "${HUB_NAV_LIMIT}" "${truncated}" "${items}"
+}
+
+run_hub_preflight() {
+    local snap="$1" token="$2" expected="$3" path actual target free_kb
+    local available_mb required_mb threshold ready=false
+    if ! hub_decode_token "${snap}" "${token}"; then
+        hub_json_error "invalid_token" "Token inválido."
+        return 1
+    fi
+    path="${G_SELECTED}"
+    if ! hub_api_prepare; then return 1; fi
+    if ! hub_snapshot_exists "${snap}"; then
+        hub_json_error "snapshot_not_found" "Snapshot não encontrado."
+        return 1
+    fi
+    if ! hub_get_item "${snap}" "${path}"; then
+        hub_json_error "item_not_found" "Item não encontrado no snapshot."
+        return 1
+    fi
+    case "${G_ITEM_TYPE}" in
+        d) actual="directory" ;;
+        f) actual="file" ;;
+        l) hub_json_error "unsafe_symlink" "Symlink não pode ser restaurado por esta API."; return 1 ;;
+        *) hub_json_error "unsupported_type" "Tipo de item não suportado."; return 1 ;;
+    esac
+    if [[ "${actual}" != "${expected}" ]]; then
+        hub_json_error "type_mismatch" "O tipo do item não corresponde ao esperado."
+        return 1
+    fi
+
+    # O preflight é read-only: usa o ancestral existente do staging e não cria
+    # diretórios nem lê qualquer conteúdo local de staging.
+    target="${RESTORE_STAGING_BASE}"
+    while [[ ! -d "${target}" && "${target}" != "/" ]]; do
+        target="$(dirname -- "${target}")"
+    done
+    free_kb="$(LC_ALL=C df -Pk "${target}" 2>/dev/null | awk 'NR == 2 {print $4}')"
+    [[ "${free_kb}" =~ ^[0-9]+$ && ${#free_kb} -le 18 ]] || {
+        hub_json_error "space_check_failed" "Não foi possível verificar o espaço disponível."
+        return 1
+    }
+    available_mb=$((free_kb / 1024))
+    required_mb=$(((G_ITEM_SIZE + 1048575) / 1048576))
+    threshold="${MIN_FREE_MB}"
+    (( required_mb > threshold )) && threshold="${required_mb}"
+    (( available_mb >= threshold )) && ready=true
+
+    printf '{"version":%d,"ok":true,"action":"preflight","snapshot":"%s","ready":%s,"item":{"type":"%s","token":"%s","size_bytes":%s},"space":{"available_mb":%d,"minimum_mb":%d,"required_mb":%d,"sufficient":%s}}\n' \
+        "${HUB_API_VERSION}" "${snap}" "${ready}" "${actual}" "${token}" "${G_ITEM_SIZE}" \
+        "${available_mb}" "${MIN_FREE_MB}" "${required_mb}" "${ready}"
+}
+
 hub_job_log_file()    { echo "${HUB_JOB_LOG_DIR}/${1}.log"; }
 hub_job_status_file() { echo "${HUB_JOB_STATUS_DIR}/${1}.status"; }
 
@@ -1293,6 +1642,10 @@ Uso:
   sudo restic-restore.sh --non-interactive --snapshot <id> --job <job_id>
                                     # restaura o snapshot completo p/ staging,
                                     # sem prompt (uso: HUB via hub-restore-shell)
+  sudo restic-restore.sh --hub-list --snapshot <id> [--token <token>]
+  sudo restic-restore.sh --hub-preflight --snapshot <id> --token <token> \
+      --expect-type <file|directory>
+                                    # API JSON read-only; uso interno do wrapper
 
 O script carrega /etc/restic/env (o mesmo do backup), abre o repositório no
 S3 e oferece um menu para restaurar arquivos, sites e bancos de dados de
@@ -1313,18 +1666,32 @@ HELP
 }
 
 main() {
-    local non_interactive=false snap_arg="" job_arg=""
+    local mode="interactive" snap_arg="" job_arg="" token_arg="" expected_type=""
 
     while (( $# > 0 )); do
         case "$1" in
             --help|-h) show_help; exit 0 ;;
-            --non-interactive) non_interactive=true; shift ;;
+            --non-interactive)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="restore"; shift ;;
+            --hub-list)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-list"; shift ;;
+            --hub-preflight)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-preflight"; shift ;;
             --snapshot)
                 [[ $# -ge 2 ]] || { echo "--snapshot exige um valor" >&2; exit 1; }
                 snap_arg="$2"; shift 2 ;;
             --job)
                 [[ $# -ge 2 ]] || { echo "--job exige um valor" >&2; exit 1; }
                 job_arg="$2"; shift 2 ;;
+            --token)
+                [[ $# -ge 2 ]] || { echo "--token exige um valor" >&2; exit 1; }
+                token_arg="$2"; shift 2 ;;
+            --expect-type)
+                [[ $# -ge 2 ]] || { echo "--expect-type exige um valor" >&2; exit 1; }
+                expected_type="$2"; shift 2 ;;
             *) echo "Argumento desconhecido: $1" >&2; exit 1 ;;
         esac
     done
@@ -1332,17 +1699,37 @@ main() {
     # Evita avisos de cwd ao rodar comandos como o usuário postgres via sudo.
     cd / || true
 
-    if [[ "${non_interactive}" == "true" ]]; then
+    if [[ "${mode}" == "restore" ]]; then
         [[ -n "${snap_arg}" ]] || { echo "--non-interactive exige --snapshot <id>" >&2; exit 1; }
         [[ -n "${job_arg}" ]]  || { echo "--non-interactive exige --job <job_id>" >&2; exit 1; }
+        [[ -z "${token_arg}" && -z "${expected_type}" ]] \
+            || { echo "--token/--expect-type não pertencem ao modo de restauração" >&2; exit 1; }
         run_non_interactive "${snap_arg}" "${job_arg}"
         return
     fi
 
-    # --snapshot/--job só têm efeito junto com --non-interactive; fora dele
-    # são combinação inválida (evita ignorar o valor silenciosamente).
-    if [[ -n "${snap_arg}" || -n "${job_arg}" ]]; then
-        echo "--snapshot/--job exigem --non-interactive" >&2
+    if [[ "${mode}" == "hub-list" ]]; then
+        valid_snapshot_id "${snap_arg}" \
+            || { hub_json_error "invalid_snapshot" "Identificador de snapshot inválido."; exit 1; }
+        [[ -z "${job_arg}" && -z "${expected_type}" ]] \
+            || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
+        run_hub_list "${snap_arg}" "${token_arg}"
+        return
+    fi
+
+    if [[ "${mode}" == "hub-preflight" ]]; then
+        valid_snapshot_id "${snap_arg}" \
+            || { hub_json_error "invalid_snapshot" "Identificador de snapshot inválido."; exit 1; }
+        [[ -z "${job_arg}" && -n "${token_arg}" \
+            && ( "${expected_type}" == "file" || "${expected_type}" == "directory" ) ]] \
+            || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
+        run_hub_preflight "${snap_arg}" "${token_arg}" "${expected_type}"
+        return
+    fi
+
+    # Flags de modos remotos nunca são ignoradas no menu interativo.
+    if [[ -n "${snap_arg}" || -n "${job_arg}" || -n "${token_arg}" || -n "${expected_type}" ]]; then
+        echo "Flags remotas exigem um modo explícito" >&2
         exit 1
     fi
 

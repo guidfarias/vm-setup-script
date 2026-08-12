@@ -148,18 +148,26 @@ install_system_packages() {
 
     # Utilitários necessários → pacote que os fornece.
     # Para estes utilitários o nome do comando == nome do pacote no apt.
-    local util_cmds="gzip tar bzip2 unzip curl"
+    # openssl + módulos Perl são usados pelo navegador seguro compartilhado
+    # de restic-restore.sh, mesmo neste instalador sem acesso remoto do HUB.
+    local util_cmds="gzip tar bzip2 unzip curl openssl perl"
     local missing=()
     local cmd
     for cmd in ${util_cmds}; do
         command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
     done
+    if command -v perl &>/dev/null \
+        && ! perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null; then
+        missing+=("perl")
+    fi
     # ca-certificates não tem um binário próprio; verifica pelo dpkg.
     if ! dpkg -s ca-certificates &>/dev/null; then
         missing+=("ca-certificates")
     fi
 
     if (( ${#missing[@]} == 0 )); then
+        perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+            || die "Módulos Perl de JSON/base64/SHA ausentes (necessários para navegação segura)."
         log_info "Todos os utilitários já presentes. Nenhuma instalação de pacote necessária."
         return 0
     fi
@@ -168,6 +176,8 @@ install_system_packages() {
     apt-get update -y || log_warn "apt-get update falhou (seguindo mesmo assim)."
     apt-get install -y "${missing[@]}" \
         || die "Falha ao instalar utilitários: ${missing[*]}"
+    perl -MJSON::PP -MMIME::Base64 -MEncode -MDigest::SHA -e 1 &>/dev/null \
+        || die "Módulos Perl de JSON/base64/SHA ausentes após instalar dependências."
     log_info "Utilitários instalados."
 }
 

@@ -390,6 +390,58 @@ As seções 6.1–6.5 abaixo continuam valendo como referência para restauraç�
 manual via `rr`/`restic` (útil em cenários que o assistente não cobre, como
 restaurar o `/home` inteiro em desastre total).
 
+### 6.0.1 — Navegação e preflight remotos do HUB
+
+O usuário SSH `hubrestore` continua preso ao forced command
+`/usr/local/bin/hub-restore-shell`, sem PTY e sem port, agent ou X11 forwarding.
+Além de `restore`, `status` e `log`, o wrapper aceita duas operações somente de
+leitura:
+
+```text
+list <snapshot_id> [token]
+preflight <snapshot_id> <token> <file|directory>
+```
+
+`list` sem token lista a raiz; com token, lista o diretório representado por
+ele. A resposta JSON v1 contém no máximo 100 filhos diretos, com `name`, `type`
+(`file` ou `directory`) e um novo `token`. O campo `truncated` informa quando o
+limite foi atingido. Symlinks e tipos especiais não são expostos.
+
+O token é opaco para o HUB: transporta o caminho em base64url e o autentica com
+HMAC-SHA256 usando uma chave local de 32 bytes em
+`/etc/restic/hub-token.key`. O MAC também inclui o ID do snapshot, portanto um
+token adulterado ou reaproveitado em outro snapshot é recusado antes de
+qualquer consulta ao Restic. O HUB nunca envia um caminho bruto e nenhuma
+entrada recebida é avaliada como shell.
+
+`preflight` confirma novamente a existência do snapshot e do item, exige que o
+tipo corresponda ao informado e mede o espaço disponível no filesystem do
+staging. Ele não cria staging, não lê arquivos locais e não executa
+`restic restore`. A resposta inclui `ready`, `size_bytes` e as métricas
+`available_mb`, `minimum_mb`, `required_mb` e `sufficient`.
+
+Exemplo de resposta de listagem:
+
+```json
+{
+  "version": 1,
+  "ok": true,
+  "action": "list",
+  "snapshot": "01234567",
+  "limit": 100,
+  "truncated": false,
+  "items": [
+    {"name": "site com espaço", "type": "directory", "token": "v1.<opaque>.<mac>"}
+  ]
+}
+```
+
+Falhas das operações novas também usam JSON v1 limitado, com `ok: false` e um
+objeto `error` contendo apenas `code` e `message`; detalhes de credenciais,
+repositório e caminhos não são devolvidos. Os comandos só ficam disponíveis
+em um servidor depois que `instalar_backup.sh` atualizar o wrapper e criar a
+chave local — o protocolo anterior segue funcionando durante o rollout.
+
 ### 6.1 — Preparar o ambiente
 
 Com o wrapper `rr` (recomendado), **não é preciso preparar nada** — ele carrega as
