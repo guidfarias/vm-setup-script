@@ -12,16 +12,24 @@
 #                                      (snapshot INTEIRO; mantido durante o rollout
 #                                      da restauração seletiva, ver restore-item)
 #   status  <job_id>                 → imprime /var/lib/hub-restore/<job_id>.status
+#                                      (legado) ou meta.json do job seletivo
+#                                      correspondente, o que existir primeiro
 #   log     <job_id>                 → imprime /var/log/hub-restore/<job_id>.log
+#                                      (legado) ou job.log do job seletivo
 #   list <snapshot_id> [token]       → lista raiz ou um diretório (JSON v1)
 #   preflight <snapshot_id> <token> <file|directory>
 #                                    → valida item e espaço (JSON v1)
 #   restore-item <snapshot_id> <token> <job_id>
-#                                    → aceita e desacopla (setsid) o job;
-#                                      responde IMEDIATAMENTE {"ok":true,"job_id":...}
-#                                      sem esperar o Restic terminar. SÓ o item
-#                                      do token, staging isolado por job, expira
-#                                      em 24h — issue #9. Acompanhe com status/log.
+#                                    → handshake síncrono curto (lock + job_dir
+#                                      + meta.json "running" confirmados pelo
+#                                      processo privilegiado); só então
+#                                      responde {"ok":true,"job_id":...} e
+#                                      desacopla (setsid) o Restic em si.
+#                                      Rejeição de spawn/sudo/lock/job
+#                                      duplicado vira erro IMEDIATO, não um
+#                                      "ok" otimista. SÓ o item do token,
+#                                      staging isolado por job, expira em 24h
+#                                      — issue #9. Acompanhe com status/log.
 #   cleanup <job_id>                 → sudo restic-restore.sh --hub-cleanup ...
 #                                      (exclusão antecipada do staging do job)
 #
@@ -37,6 +45,11 @@ set -uo pipefail
 readonly RESTORE_BIN="/usr/local/bin/restic-restore.sh"
 readonly HUB_JOB_LOG_DIR="/var/log/hub-restore"
 readonly HUB_JOB_STATUS_DIR="/var/lib/hub-restore"
+readonly HUB_ITEM_STAGING_DIR="/var/lib/hub-restore/items"
+# Timeout da fase síncrona de restore-item (aquisição de lock + criação do
+# job_dir + meta.json "running"). É só a preparação, não o Restic em si —
+# alguns décimos de segundo em condições normais; a folga cobre disco lento.
+readonly HANDSHAKE_TIMEOUT_S=8
 
 SNAPSHOT_RE='^[0-9a-f]{8,64}$'
 JOB_RE='^[A-Za-z0-9-]{1,64}$'
@@ -78,18 +91,37 @@ case "${action}" in
         job="${parts[1]}"
         [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
         status_file="${HUB_JOB_STATUS_DIR}/${job}.status"
-        [[ -f "${status_file}" ]] || reject "status inexistente para job ${job}"
-        log_attempt "status job=${job}"
-        cat -- "${status_file}"
+        # Protocolo legado (--non-interactive) primeiro; se não existir, tenta
+        # o meta.json de um job seletivo com o mesmo job_id — os dois espaços
+        # de nomes de job_id não colidem na prática (o HUB escolhe), mas o
+        # fallback cobre os dois sem exigir que o cliente saiba qual protocolo
+        # criou o job.
+        item_meta="${HUB_ITEM_STAGING_DIR}/${job}/meta.json"
+        if [[ -f "${status_file}" ]]; then
+            log_attempt "status job=${job} (legado)"
+            cat -- "${status_file}"
+        elif [[ -f "${item_meta}" ]]; then
+            log_attempt "status job=${job} (seletivo)"
+            cat -- "${item_meta}"
+        else
+            reject "status inexistente para job ${job}"
+        fi
         ;;
     log)
         (( ${#parts[@]} == 2 )) || reject "uso: log <job_id> — recebido: ${cmd}"
         job="${parts[1]}"
         [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
         log_file="${HUB_JOB_LOG_DIR}/${job}.log"
-        [[ -f "${log_file}" ]] || reject "log inexistente para job ${job}"
-        log_attempt "log job=${job}"
-        cat -- "${log_file}"
+        item_log="${HUB_ITEM_STAGING_DIR}/${job}/job.log"
+        if [[ -f "${log_file}" ]]; then
+            log_attempt "log job=${job} (legado)"
+            cat -- "${log_file}"
+        elif [[ -f "${item_log}" ]]; then
+            log_attempt "log job=${job} (seletivo)"
+            cat -- "${item_log}"
+        else
+            reject "log inexistente para job ${job}"
+        fi
         ;;
     list)
         (( ${#parts[@]} == 2 || ${#parts[@]} == 3 )) \
@@ -129,8 +161,17 @@ case "${action}" in
         # setsid cria uma nova sessão (imune a SIGHUP/SIGTERM do terminal que
         # se desconectou); stdio vai só para dentro do sudo -n, que por sua
         # vez tem RESTORE_LOG_FILE (job.log) como destino real via o próprio
-        # restic-restore.sh. A resposta ao cliente é imediata: só confirma
-        # que o job foi aceito, não espera o Restic terminar.
+        # restic-restore.sh.
+        #
+        # Handshake síncrono e curto ANTES de responder ao cliente: o
+        # processo privilegiado cria ${job_dir}/.ready assim que lock +
+        # job_dir + meta.json "running" estão garantidos (ver
+        # run_hub_restore_item). Só depois disso o wrapper responde "ok" —
+        # rejeição de spawn/sudo, lock ocupado ou job_id duplicado (EEXIST)
+        # vira erro IMEDIATO ao cliente, não um "ok" mentiroso. O Restic em
+        # si (a parte longa) continua rodando em background depois do
+        # handshake.
+        ready_file="${HUB_ITEM_STAGING_DIR}/${job}/.ready"
         if command -v setsid >/dev/null 2>&1; then
             setsid sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
                 --token "${token}" --job "${job}" \
@@ -140,7 +181,27 @@ case "${action}" in
                 --token "${token}" --job "${job}" \
                 </dev/null >/dev/null 2>&1 &
         fi
-        disown 2>/dev/null || true
+        child_pid=$!
+        handshake_done=0
+        handshake_deadline=$(( $(date +%s) + HANDSHAKE_TIMEOUT_S ))
+        while (( $(date +%s) < handshake_deadline )); do
+            if [[ -f "${ready_file}" ]]; then
+                handshake_done=1
+                break
+            fi
+            if ! kill -0 "${child_pid}" 2>/dev/null; then
+                # Processo morreu antes de preparar: captura o rc real (o
+                # child já não é mais filho vivo do wait, mas como não demos
+                # disown ainda, wait funciona e reaproveita o status).
+                wait "${child_pid}" 2>/dev/null
+                reject "job ${job} recusado antes de iniciar (spawn/sudo/lock/duplicado) — veja log job=${job}"
+            fi
+            sleep 0.1
+        done
+        if (( ! handshake_done )); then
+            reject "job ${job}: preparação não confirmou a tempo (${HANDSHAKE_TIMEOUT_S}s) — verifique status/log"
+        fi
+        disown "${child_pid}" 2>/dev/null || disown 2>/dev/null || true
         printf '{"version":1,"ok":true,"action":"restore-item","job_id":"%s"}\n' "${job}"
         exit 0
         ;;

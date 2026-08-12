@@ -308,6 +308,10 @@ validate_env_safe() {
     [[ -n "${AWS_SECRET_ACCESS_KEY}" ]] || { error "AWS_SECRET_ACCESS_KEY não definido no env."; return 1; }
     [[ -n "${RESTIC_PASSWORD}" ]]       || { error "RESTIC_PASSWORD não definido no env."; return 1; }
     [[ -n "${S3_BUCKET}" ]]             || { error "S3_BUCKET não definido no env."; return 1; }
+    # MIN_FREE_MB entra em aritmética (( )) sob set -u mais adiante — um valor
+    # não numérico no env quebraria o script no meio do fluxo hub em vez de
+    # falhar aqui, cedo e com mensagem clara.
+    [[ "${MIN_FREE_MB}" =~ ^[0-9]+$ ]] || { error "MIN_FREE_MB inválido no env: '${MIN_FREE_MB}'."; return 1; }
     return 0
 }
 
@@ -356,6 +360,7 @@ check_free_space_fail_closed() {
     local target="$1" item_size_bytes="${2:-0}" free_mb threshold_mb item_mb
     free_mb="$(df -Pm "${target}" 2>/dev/null | awk 'NR==2 {print $4}')"
     [[ "${free_mb}" =~ ^[0-9]+$ ]] || { warn "Não foi possível medir espaço livre em ${target}."; return 1; }
+    [[ "${MIN_FREE_MB}" =~ ^[0-9]+$ ]] || { warn "MIN_FREE_MB inválido: '${MIN_FREE_MB}'."; return 1; }
     threshold_mb="${MIN_FREE_MB}"
     if [[ "${item_size_bytes}" =~ ^[0-9]+$ ]] && (( item_size_bytes > 0 )); then
         item_mb=$(((item_size_bytes + 1048575) / 1048576))
@@ -430,7 +435,15 @@ restic_ls_records() {
 decode_restic_path() {
     local encoded="$1" padded="${1//-/+}"
     [[ "${encoded}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
-    padded="${padded//_/\/}"
+    # BUG CORRIGIDO: "${padded//_/\/}" produz "\/" literal (barra invertida +
+    # barra), não "/" — o \ dentro do padrão de substituição bash não é
+    # tratado como escape aqui. Isso quebrava a decodificação de qualquer
+    # path cujo base64url contivesse '_' (comum; sem relação com o nome ter
+    # caracteres especiais). A forma correta usa uma variável para o valor
+    # de substituição, evitando ambiguidade com o delimitador "/" do próprio
+    # operador de substituição.
+    local slash='/'
+    padded="${padded//_/${slash}}"
     case $(( ${#padded} % 4 )) in
         0) ;;
         2) padded+="==" ;;
@@ -1423,7 +1436,11 @@ hub_base64url_encode() {
 
 hub_base64url_decode() {
     local payload="$1" padded="${1//-/+}"
-    padded="${padded//_/\/}"
+    # Mesma correção de decode_restic_path: "\/" no padrão de substituição
+    # bash não vira "/", produz "\/" literal — quebrava tokens cujo payload
+    # base64url contivesse '_'.
+    local slash='/'
+    padded="${padded//_/${slash}}"
     case $(( ${#padded} % 4 )) in
         0) ;;
         2) padded+="==" ;;
@@ -1539,6 +1556,28 @@ hub_get_item() {
     [[ -n "${G_ITEM_TYPE}" && "${G_ITEM_SIZE}" =~ ^[0-9]+$ && ${#G_ITEM_SIZE} -le 18 ]]
 }
 
+# Restic reporta size=0 no próprio nó de um diretório (não soma filhos). Para
+# a checagem de espaço fazer sentido num diretório, somamos o size de todos
+# os arquivos descendentes — `restic ls --json <snap> <dir>` já lista a
+# árvore inteira recursivamente. Fail-closed: qualquer falha de leitura
+# retorna 1 (chamada deve tratar como "não sei o tamanho", não como "0").
+hub_dir_total_size() {
+    local snap="$1" dir="$2" records t size encoded total=0
+    records="$(mktemp)" || return 1
+    if ! restic_ls_records "${snap}" "${dir}" >"${records}"; then
+        rm -f "${records}"
+        return 1
+    fi
+    while IFS=$'\t' read -r t size encoded; do
+        [[ "${t}" == "f" ]] || continue
+        [[ "${size}" =~ ^[0-9]+$ ]] || continue
+        total=$((total + size))
+    done < "${records}"
+    rm -f "${records}"
+    [[ "${#total}" -le 18 ]] || return 1
+    G_ITEM_SIZE="${total}"
+}
+
 run_hub_list() {
     local snap="$1" token="${2:-}" dir="/" i path type name item_token
     local items="" count=0 truncated=false
@@ -1622,6 +1661,18 @@ run_hub_preflight() {
     if [[ "${actual}" != "${expected}" ]]; then
         hub_json_error "type_mismatch" "O tipo do item não corresponde ao esperado."
         return 1
+    fi
+
+    # G_ITEM_SIZE de um diretório vem 0 do Restic (o nó não soma filhos) —
+    # sem isso, a checagem de espaço abaixo cairia sempre no mínimo genérico
+    # (MIN_FREE_MB), aceitando "pronto" mesmo quando o conteúdo real do
+    # diretório não caiba no staging. Fail-closed: se não conseguir somar o
+    # tamanho real, reporta falha em vez de seguir com um valor errado.
+    if [[ "${actual}" == "directory" ]]; then
+        if ! hub_dir_total_size "${snap}" "${path}"; then
+            hub_json_error "size_check_failed" "Não foi possível calcular o tamanho do diretório."
+            return 1
+        fi
     fi
 
     # O preflight é read-only: usa o ancestral existente do staging e não cria
@@ -1748,12 +1799,15 @@ write_job_meta() {
     local dir tmp
     dir="$(hub_item_job_dir "${job_id}")"
     tmp="$(mktemp "${dir}/.meta.XXXXXX")" || return 1
-    printf '{"version":%d,"job_id":"%s","snapshot":"%s","path":"%s","item_type":"%s","status":"%s","created_at":%d,"expires_at":%d,"staging_dir":"%s"}\n' \
+    if ! printf '{"version":%d,"job_id":"%s","snapshot":"%s","path":"%s","item_type":"%s","status":"%s","created_at":%d,"expires_at":%d,"staging_dir":"%s"}\n' \
         "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "$(hub_json_escape "${snap}")" \
         "$(hub_json_escape "${path}")" "$(hub_json_escape "${item_type}")" "$(hub_json_escape "${status}")" \
-        "${created}" "${expires}" "$(hub_json_escape "${dir}")" > "${tmp}"
+        "${created}" "${expires}" "$(hub_json_escape "${dir}")" > "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
     chgrp hubrestore "${tmp}" 2>/dev/null || true
-    chmod 640 "${tmp}"
+    chmod 640 "${tmp}" || { rm -f "${tmp}"; return 1; }
     mv -f "${tmp}" "$(hub_item_meta_file "${job_id}")"
 }
 
@@ -1799,6 +1853,10 @@ hub_item_finalize() {
     finished="$(date +%s)"
     if ! update_job_meta_status_finished "${job_id}" "${status}" "${finished}"; then
         error "Job ${job_id}: falha ao gravar meta.json final (status pretendido: ${status}) — inconsistência auditável em ${RESTORE_LOG_FILE:-log indisponível}."
+        # A gravação final falhou: mesmo que o status pretendido fosse
+        # "success" (exit_code=0), o rc do processo não pode mentir que deu
+        # tudo certo quando o meta.json não reflete isso — força não-zero.
+        exit_code=1
     fi
     exit "${exit_code}"
 }
@@ -1857,6 +1915,16 @@ run_hub_restore_item() {
         || die "Job ${job_id}: falha ao gravar meta.json inicial — abortando antes do Restic."
     info "Job ${job_id}: restauração seletiva iniciada — snapshot ${snap}, item ${path}."
 
+    # Handshake com o hub-restore-shell: a partir daqui lock + job_dir +
+    # meta.json "running" estão garantidos (todas as rejeições possíveis —
+    # job duplicado via EEXIST do mkdir, lock ocupado, token inválido — já
+    # aconteceram acima e teriam terminado o processo antes deste ponto). O
+    # wrapper espera este arquivo (fase síncrona curta) antes de responder
+    # "ok" ao cliente; só o restic em si roda depois, desacoplado.
+    : > "${job_dir}/.ready" 2>/dev/null || true
+    chgrp hubrestore "${job_dir}/.ready" 2>/dev/null || true
+    chmod 640 "${job_dir}/.ready" 2>/dev/null || true
+
     if ! load_env_file_safe 2>>"${RESTORE_LOG_FILE}"; then
         hub_item_finalize "${job_id}" "failed env: ${RESTIC_ENV_FILE} indisponível/inválido" 1
     fi
@@ -1879,6 +1947,15 @@ run_hub_restore_item() {
         f) item_type="file" ;;
         *) hub_item_finalize "${job_id}" "failed tipo de item não suportado" 1 ;;
     esac
+    # G_ITEM_SIZE de um diretório vem 0 do Restic (nó não soma filhos); sem
+    # recalcular, check_free_space_fail_closed cairia no MIN_FREE_MB genérico
+    # e poderia liberar espaço insuficiente para o conteúdo real. Fail-closed:
+    # se não conseguir somar, falha aqui em vez de seguir com 0.
+    if [[ "${item_type}" == "directory" ]]; then
+        if ! hub_dir_total_size "${snap}" "${path}" 2>>"${RESTORE_LOG_FILE}"; then
+            hub_item_finalize "${job_id}" "failed não foi possível calcular o tamanho do diretório" 1
+        fi
+    fi
     item_size="${G_ITEM_SIZE:-0}"
     write_job_meta "${job_id}" "${snap}" "${path}" "${item_type}" "running" "${now}" "${expires}" \
         || hub_item_finalize "${job_id}" "failed erro ao persistir meta.json antes do Restic" 1
@@ -1926,8 +2003,20 @@ update_job_meta_status_finished() {
 # daquele diretório antes de apagar. Só remove depois de confirmar (com o
 # lock global adquirido) que nenhum restore-item está com o job em "running"
 # — evita apagar staging por baixo de uma restauração em andamento.
+#
+# hub_item_remove_job <job_id> [allow_expired_running]
+# allow_expired_running=1 é usado SÓ pela varredura de cron: com o lock em
+# mãos (prova de que nenhum restore-item está de fato ativo agora), um
+# status "running" cujo expires_at já passou é necessariamente órfão —
+# processo morto por crash/SIGKILL/reboot antes de finalizar o job, nunca
+# vai liberar o lock nem atualizar o meta.json sozinho. Sem essa exceção,
+# esse staging ficaria preso para sempre, quebrando a garantia de expiração
+# em 24h. Exclusão ANTECIPADA (chamada explícita por job_id) nunca passa
+# allow_expired_running=1 — running running é sempre recusado ali, mesmo
+# expirado, para não apagar por engano algo que o operador não pediu.
 hub_item_remove_job() {
-    local job_id="$1" dir resolved_dir resolved_base meta status
+    local job_id="$1" allow_expired_running="${2:-0}"
+    local dir resolved_dir resolved_base meta status expires_at now
 
     valid_job_id_selective "${job_id}" || return 1
     dir="$(hub_item_job_dir "${job_id}")"
@@ -1949,9 +2038,15 @@ hub_item_remove_job() {
     if [[ -f "${meta}" ]]; then
         status="$(perl -MJSON::PP -e 'local $/; my $d = eval { decode_json(<STDIN>) }; print $d->{status} // "" if ref $d eq "HASH";' < "${meta}" 2>/dev/null)"
         if [[ "${status}" == "running" ]]; then
-            warn "Job ${job_id}: status running — limpeza recusada."
-            exec 10>&-
-            return 1
+            expires_at="$(perl -MJSON::PP -e 'local $/; my $d = eval { decode_json(<STDIN>) }; print $d->{expires_at} // "" if ref $d eq "HASH";' < "${meta}" 2>/dev/null)"
+            now="$(date +%s)"
+            if [[ "${allow_expired_running}" == "1" && "${expires_at}" =~ ^[0-9]+$ && now -ge expires_at ]]; then
+                warn "Job ${job_id}: status running mas expirado (órfão — lock livre e expires_at no passado); removendo."
+            else
+                warn "Job ${job_id}: status running — limpeza recusada."
+                exec 10>&-
+                return 1
+            fi
         fi
     fi
 
@@ -1971,7 +2066,9 @@ hub_item_remove_job() {
 # Limpeza idempotente: sem --job, varre todos os jobs expirados (rodada via
 # cron a cada N minutos). Com --job, apaga só aquele (exclusão antecipada).
 # Idempotente nos dois casos: job/staging já ausente não é erro. Job "running"
-# nunca é removido (hub_item_remove_job recusa via lock + revalidação).
+# só é removido pela varredura quando já passou de expires_at (órfão de
+# crash/SIGKILL/reboot); a exclusão antecipada por --job nunca remove um job
+# "running", mesmo expirado.
 run_hub_cleanup() {
     local target_job="${1:-}" job_id meta expires job_dir now removed=0
 
@@ -2003,7 +2100,7 @@ run_hub_cleanup() {
             expires=$(( $(stat -c '%Y' "${job_dir}" 2>/dev/null || stat -f '%m' "${job_dir}" 2>/dev/null || echo "${now}") + HUB_ITEM_TTL_SECONDS ))
         fi
         (( now < expires )) && continue
-        if hub_item_remove_job "${job_id}"; then
+        if hub_item_remove_job "${job_id}" 1; then
             info "Job ${job_id}: expirado, staging removido."
             removed=$((removed + 1))
         else

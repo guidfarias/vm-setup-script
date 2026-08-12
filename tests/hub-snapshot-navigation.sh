@@ -409,7 +409,10 @@ json_assert "${OUT_FILE}" \
     "schema e métricas do preflight de arquivo"
 run_restore --hub-preflight --snapshot "${SNAPSHOT}" --token "${TOKEN_HOME}" --expect-type directory
 assert_eq "0" "${RUN_RC}" "preflight de diretório"
-json_assert "${OUT_FILE}" "data['item']['type'] == 'directory' and data['item']['size_bytes'] == 0 and data['ready'] is True" \
+# size_bytes soma os descendentes (33 + 4, ver mock de /home acima) — o
+# Restic reporta 0 no próprio nó do diretório, mas isso subestimaria o
+# espaço necessário; hub_dir_total_size soma os arquivos recursivamente.
+json_assert "${OUT_FILE}" "data['item']['type'] == 'directory' and data['item']['size_bytes'] == 37 and data['ready'] is True" \
     "preflight de diretório"
 run_restore --hub-preflight --snapshot "${SNAPSHOT}" --token "${TOKEN_UNICODE}" --expect-type file
 assert_eq "0" "${RUN_RC}" "preflight de nome com aspas/unicode"

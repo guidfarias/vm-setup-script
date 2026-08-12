@@ -25,6 +25,8 @@ LOCK_FILE="${TMP_DIR}/job.lock"
 OUT_FILE="${TMP_DIR}/stdout"
 ERR_FILE="${TMP_DIR}/stderr"
 INCLUDE_LOG="${TMP_DIR}/restore.includes"
+MATCHED_LOG="${TMP_DIR}/restore.matched"
+SIBLINGS_FILE="${TMP_DIR}/glob.siblings"
 
 SNAPSHOT="01234567"
 TOKEN_KEY_HEX="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -94,6 +96,8 @@ run_restore() {
         MOCK_SUDO_LOG="${SUDO_LOG}" \
         MOCK_LOGGER_LOG="${LOGGER_LOG}" \
         MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
+        MOCK_MATCHED_LOG="${MATCHED_LOG}" \
+        MOCK_SIBLINGS_FILE="${SIBLINGS_FILE}" \
         "${RESTORE_COPY}" "$@" >"${OUT_FILE}" 2>"${ERR_FILE}"
     RUN_RC=$?
 }
@@ -172,6 +176,13 @@ case "$1" in
             '/nome[esquisito]*.txt')
                 echo '{"struct_type":"node","path":"/nome[esquisito]*.txt","type":"file","size":7}'
                 ;;
+            '/a?txt')
+                # Item real cujo nome contém um metacaractere de glob do
+                # restic ('?' casa 1 char qualquer). Existe também /abtxt no
+                # snapshot (ver GLOB_SIBLINGS abaixo) — sem escape, o padrão
+                # cru '/a?txt' casaria os dois.
+                echo '{"struct_type":"node","path":"/a?txt","type":"file","size":3}'
+                ;;
             *) exit 1 ;;
         esac
         ;;
@@ -180,12 +191,29 @@ case "$1" in
         # Grava o --include literal recebido, para o teste de glob confirmar
         # que o caminho foi escapado antes de chegar ao Restic (senão um
         # padrão como '*' casaria outros itens do snapshot).
+        include=""
         for ((i = 1; i <= $#; i++)); do
             if [[ "${!i}" == "--include" ]]; then
                 j=$((i + 1))
-                printf '%s\n' "${!j}" >> "${MOCK_INCLUDE_LOG:-/dev/null}"
+                include="${!j}"
+                printf '%s\n' "${include}" >> "${MOCK_INCLUDE_LOG:-/dev/null}"
             fi
         done
+        # Simula a expansão do padrão --include contra a lista completa do
+        # snapshot (GLOB_SIBLINGS): cada arquivo do "snapshot" cujo nome
+        # cru CASA o padrão recebido conta como "materializado". Se o
+        # caminho foi escapado corretamente, só o item exato casa; se não
+        # foi, o irmão com metacaractere também casaria.
+        if [[ -n "${include}" && -n "${MOCK_MATCHED_LOG:-}" && -f "${MOCK_SIBLINGS_FILE:-/dev/null}" ]]; then
+            : > "${MOCK_MATCHED_LOG}"
+            while IFS= read -r candidate; do
+                [[ -n "${candidate}" ]] || continue
+                # shellcheck disable=SC2053 # comparação de glob intencional
+                if [[ "${candidate}" == ${include} ]]; then
+                    printf '%s\n' "${candidate}" >> "${MOCK_MATCHED_LOG}"
+                fi
+            done < "${MOCK_SIBLINGS_FILE}"
+        fi
         exit 0
         ;;
     *) exit 94 ;;
@@ -224,6 +252,7 @@ TOKEN_FILE="$(token_for_path "${SNAPSHOT}" "/arquivo.txt")"
 TOKEN_DIR="$(token_for_path "${SNAPSHOT}" "/diretorio")"
 TOKEN_MISSING="$(token_for_path "${SNAPSHOT}" "/nao-existe")"
 TOKEN_GLOB="$(token_for_path "${SNAPSHOT}" '/nome[esquisito]*.txt')"
+TOKEN_A_QMARK="$(token_for_path "${SNAPSHOT}" '/a?txt')"
 
 if (( HAVE_FLOCK )); then
     # 1. Arquivo: materializa só o item, meta.json completo, staging isolado.
@@ -285,8 +314,22 @@ if (( HAVE_FLOCK )); then
     assert_contains "${INCLUDE_LOG}" '/nome\[esquisito\]\*.txt' "--include recebido pelo restic deve estar escapado"
     grep -qF '/nome[esquisito]*.txt' "${INCLUDE_LOG}" && fail "--include não pode chegar ao restic sem escape (viraria glob real)"
     pass "item com * ? [ ] no nome é passado ao restic como padrão literal (escapado), só o item exato é materializado"
+
+    # 12. Colisão de glob de verdade: /a?txt existe no snapshot, e /abtxt é um
+    # IRMÃO que o padrão CRU '/a?txt' (sem escape) também casaria (? = 1
+    # caractere qualquer). Simula a expansão do --include recebido contra os
+    # dois nomes reais do "snapshot" e prova que só o item pedido casa.
+    printf '/a?txt\n/abtxt\n' > "${SIBLINGS_FILE}"
+    : > "${MATCHED_LOG}"
+    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_A_QMARK}" --job job-glob-collision-1
+    assert_eq "0" "${RUN_RC}" "restauração de /a?txt (colisão de glob)"
+    [[ -s "${MATCHED_LOG}" ]] || fail "MATCHED_LOG vazio — mock de expansão de glob não rodou"
+    assert_eq "1" "$(wc -l < "${MATCHED_LOG}" | tr -d ' ')" "exatamente 1 item deve casar o --include"
+    assert_contains "${MATCHED_LOG}" '/a?txt' "o item exato deve casar"
+    grep -qxF '/abtxt' "${MATCHED_LOG}" && fail "/abtxt (irmão) não pode casar — prova que o --include NÃO foi escapado corretamente"
+    pass "irmão que casaria o padrão cru (/abtxt vs /a?txt) não é materializado — só o item exato"
 else
-    echo "# aviso: 'flock' ausente neste sistema — pulando cenários 1-6, 9 e 11 (execução real de --hub-restore-item)." >&2
+    echo "# aviso: 'flock' ausente neste sistema — pulando cenários 1-6, 9, 11 e 12 (execução real de --hub-restore-item)." >&2
 fi
 
 # 7. Queda do cliente a meio caminho: job sem meta.json (SSH caiu antes do
