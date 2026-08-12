@@ -1,21 +1,31 @@
 Closes #
 
-## Summary
+## Resumo
 
-<!-- O que mudou e por quê. Uma pessoa que não leu o issue precisa entender. -->
+<!-- O que mudou e por quê. -->
 
-## Test plan
+## Plano de testes
 
-<!-- Comandos rodados + cenários cobertos. O orquestrador valida esta seção. -->
+<!-- Comandos executados e cenários cobertos. -->
 
-- [ ] `precommit` verde localmente
-- [ ] Testes afetados verdes localmente
+- [ ] Precommit passou localmente
+- [ ] Testes afetados passaram localmente
+- [ ] Suíte completa passou ou a limitação está documentada
 
-## Scope check
+## Verificação de escopo
 
-- [ ] Só arquivos listados no issue foram tocados (ou o desvio está justificado abaixo)
-- [ ] Nenhuma feature flag foi ligada neste PR
+- [ ] Arquivos adicionais estão justificados
+- [ ] Nenhuma capacidade foi removida sem solicitação
+- [ ] Nenhum comportamento ou contrato novo foi introduzido silenciosamente
+
+## Preview
+
+<!-- Não necessário, Servidor para QA ou URL + estados aprovados. -->
 
 ## Rollout
 
-<!-- Flag, backfill, migration, ou "n/a". -->
+<!-- Flag, migration, backfill ou “não aplicável”. Nenhuma ação é automática. -->
+
+## Evidências de qualidade
+
+<!-- QA, revisão adversarial e achados corrigidos. Preenchido durante o ciclo. -->
