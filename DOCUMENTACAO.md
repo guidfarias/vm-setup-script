@@ -542,6 +542,65 @@ caminho arbitrário do chamador.
 O comando `restore` (snapshot inteiro) continua disponível durante o
 rollout, que por ora se limita ao `onepage` sob teste supervisionado.
 
+### 6.0.3 — Navegação e download do staging de um job concluído (issue #10)
+
+Depois que um `restore-item` termina com sucesso, o operador ainda
+precisaria de acesso SSH de verdade para inspecionar ou copiar o resultado.
+O wrapper aceita três operações novas, todas restritas ao `data/` do job:
+
+```text
+staging-list <job_id> [token]
+staging-stat <job_id> <token>
+staging-download <job_id> <token>
+```
+
+Só um job com `status: "success"` e ainda **dentro do prazo de 24h** expõe
+conteúdo. Job inexistente, `running`, `failed` ou expirado recebem o
+**mesmo** erro genérico (`job_not_ready`) — o cliente não aprende qual dos
+quatro é o caso real, o que evita usar a API como oráculo do estado interno
+do job.
+
+`staging-list` funciona como o `list` de navegação de snapshot, mas sobre o
+staging real em disco (`.../items/<job_id>/data/`) em vez do repositório
+Restic: sem token lista a raiz do item restaurado; com token, lista um
+subdiretório. A resposta JSON v1 tem no máximo 100 filhos diretos
+(`name`, `type`, `token`), com `truncated` quando o limite é atingido.
+Symlinks e tipos especiais nunca são listados — nem os internos ao staging,
+nem os que apontam para fora dele.
+
+`staging-stat` confirma tipo (`file`/`directory`) e tamanho em bytes de um
+item específico do staging, sem ler o conteúdo.
+
+`staging-download` transmite o item em **stdout**: um arquivo vai cru (sem
+transformação, sem ser carregado inteiro em memória — o kernel faz o
+streaming via `cat`); um diretório é empacotado sob demanda como `tar`
+direto no stdout, nunca materializado num `.tar.gz` intermediário em disco.
+**Nenhum diagnóstico entra nesse stream**: qualquer mensagem de erro ou aviso
+vai só para stderr/log, nunca para stdout — o HUB pode gravar o stdout
+direto num arquivo sem risco de misturar texto de erro nos bytes binários.
+
+**Tokens são de um domínio diferente dos de navegação de snapshot.** O
+mesmo protocolo HMAC-SHA256 é reaproveitado (chave local em
+`/etc/restic/hub-token.key`), mas o prefixo é `v1s` (vs. `v1` da navegação
+de snapshot) e o MAC é calculado sobre `(job_id, caminho relativo dentro de
+data/)` em vez de `(snapshot, caminho do snapshot)`. Um token de um domínio
+nunca é aceito no outro, e um token assinado para um `job_id` nunca é aceito
+para outro job.
+
+**Confinamento ao staging do job.** Todo caminho recebido é resolvido com
+`realpath` (symlinks seguidos) e precisa continuar estritamente dentro do
+`data/` do job depois de resolvido — symlink apontando para fora (mesmo que
+interno ao próprio staging, apontando para outro arquivo dele) e qualquer
+traversal são recusados antes de qualquer leitura. Essa é a segunda camada
+de defesa: a primeira já recusa `..`, `//` e caracteres de controle na forma
+textual do token, antes mesmo de tocar o disco.
+
+**Exclusão antecipada.** Não há um comando novo para isso — `cleanup
+<job_id>` (o mesmo do restore seletivo, issue #9) já remove o staging
+inteiro do job, incluindo o que `staging-download` exporia. Depois de
+removido, qualquer `staging-list`/`staging-stat`/`staging-download` para
+aquele `job_id` volta a falhar com `job_not_ready`.
+
 ### 6.1 — Preparar o ambiente
 
 Com o wrapper `rr` (recomendado), **não é preciso preparar nada** — ele carrega as

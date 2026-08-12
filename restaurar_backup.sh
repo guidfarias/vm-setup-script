@@ -1495,6 +1495,143 @@ hub_decode_token() {
     G_SELECTED="${path}"
 }
 
+# ---------------------------------------------------------------------------
+# NAVEGAÇÃO/DOWNLOAD NO STAGING DE UM JOB CONCLUÍDO (issue #10)
+# ---------------------------------------------------------------------------
+# Mesmo protocolo de token do HUB (HMAC-SHA256, chave local), mas assinado
+# sobre (job_id, caminho relativo dentro de data/) em vez de (snapshot,
+# caminho do snapshot) — prefixo "v1s" (vs. "v1" da navegação de snapshot)
+# impede que um token de uma API seja reaproveitado na outra por engano ou
+# por um cliente malicioso.
+
+hub_staging_token_hmac() {
+    local job_id="$1" payload="$2" digest
+    hub_token_key >/dev/null || return 1
+    digest="$(printf 'v1s\0%s\0%s' "${job_id}" "${payload}" \
+        | HUB_HMAC_KEY_PATH="${HUB_TOKEN_KEY_FILE}" perl -MDigest::SHA=hmac_sha256_hex -e '
+            open my $fh, "<", $ENV{HUB_HMAC_KEY_PATH} or exit 1;
+            my $hex = <$fh>; close $fh; chomp $hex;
+            $hex =~ /^[0-9a-f]{64}$/ or exit 1;
+            binmode STDIN;
+            local $/;
+            my $data = <STDIN>;
+            print hmac_sha256_hex($data, pack("H*", $hex));
+        ' 2>/dev/null)" || return 1
+    [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "${digest}"
+}
+
+# rel_path já vem canônico ("/" = raiz de data/, ou "/sub/arquivo"), mesma
+# gramática de hub_path_is_safe usada na navegação de snapshot.
+hub_make_staging_token() {
+    local job_id="$1" rel_path="$2" payload mac
+    hub_path_is_safe "${rel_path}" || return 1
+    payload="$(printf '%s' "${rel_path}" | hub_base64url_encode)" || return 1
+    [[ "${payload}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
+    mac="$(hub_staging_token_hmac "${job_id}" "${payload}")" || return 1
+    printf 'v1s.%s.%s' "${payload}" "${mac}"
+}
+
+# Define G_SELECTED com o caminho relativo autenticado (dentro de data/ do
+# job_id informado). MAC verificado antes de decodificar e antes de tocar o
+# filesystem — o job_id faz parte do que é assinado, então um token de um job
+# nunca é aceito para outro.
+hub_decode_staging_token() {
+    local job_id="$1" token="$2" payload supplied_mac expected_mac rel_path canonical
+    [[ "${token}" =~ ^v1s\.([A-Za-z0-9_-]+)\.([0-9a-f]{64})$ ]] || return 1
+    payload="${BASH_REMATCH[1]}"
+    supplied_mac="${BASH_REMATCH[2]}"
+    (( ${#payload} >= 2 && ${#payload} <= 5462 )) || return 1
+    expected_mac="$(hub_staging_token_hmac "${job_id}" "${payload}")" || return 1
+    hub_constant_time_hex_equal "${supplied_mac}" "${expected_mac}" || return 1
+    rel_path="$(hub_base64url_decode "${payload}")" || return 1
+    [[ -n "${rel_path}" ]] || return 1
+    hub_path_is_safe "${rel_path}" || return 1
+    canonical="$(printf '%s' "${rel_path}" | hub_base64url_encode)" || return 1
+    [[ "${canonical}" == "${payload}" ]] || return 1
+    G_SELECTED="${rel_path}"
+}
+
+# Lê status/expires_at do meta.json de um job. Ecoa "<status_word> <expires_at>"
+# ou falha se o meta.json não existe/não é JSON válido. status_word é só a
+# PRIMEIRA palavra do campo status (ex.: "failed algo" vira "failed") —
+# suficiente para diferenciar running/success/failed sem vazar o motivo.
+# Um único processo Perl (não dois) mantém o custo de "job inexistente"
+# (falha no -f, sem spawn) e "job existente mas não pronto" (um spawn) mais
+# próximos entre si — reduz, sem eliminar, o canal de timing entre os dois
+# casos que hub_staging_job_ready mascara com a mesma mensagem de erro.
+hub_staging_job_state() {
+    local job_id="$1" meta result
+    meta="$(hub_item_meta_file "${job_id}")"
+    [[ -f "${meta}" ]] || return 1
+    result="$(perl -MJSON::PP -e '
+        local $/; my $d = eval { decode_json(<STDIN>) };
+        exit 1 if $@ || ref($d) ne "HASH";
+        my $s = $d->{status} // "";
+        $s =~ s/\s.*$//s;
+        my $e = $d->{expires_at} // "";
+        exit 1 if $s eq "" || $e !~ /^\d+$/;
+        print "$s $e";
+    ' < "${meta}" 2>/dev/null)" || return 1
+    [[ "${result}" =~ ^[^\ ]+\ [0-9]+$ ]] || return 1
+    printf '%s' "${result}"
+}
+
+# Só jobs "success" e ainda dentro do prazo expõem conteúdo. Job inexistente,
+# running, failed ou expirado são todos recusados da mesma forma — o cliente
+# não aprende qual desses é o caso real (evita reconhecimento de estado
+# interno via oráculo de erro).
+hub_staging_job_ready() {
+    local job_id="$1" state status expires now
+    state="$(hub_staging_job_state "${job_id}")" || return 1
+    read -r status expires <<< "${state}"
+    [[ "${status}" == "success" ]] || return 1
+    now="$(date +%s)"
+    (( now < expires )) || return 1
+    return 0
+}
+
+# Resolve <data_dir>/<rel_path> para um caminho REAL (realpath, symlinks
+# seguidos) e confirma que ele continua estritamente dentro de data_dir
+# resolvido. Recusa symlink apontando para fora, ".." e qualquer traversal
+# que o realpath exponha — hub_path_is_safe já bloqueia ".."/"//" na forma
+# textual do token, isto é a segunda camada, contra o conteúdo real do disco.
+# Define STAGING_RESOLVED_PATH e STAGING_RESOLVED_TYPE (f|d) em caso de êxito.
+hub_staging_resolve() {
+    local data_dir="$1" rel_path="$2" base target resolved_base resolved_target
+    STAGING_RESOLVED_PATH=""; STAGING_RESOLVED_TYPE=""
+    base="${data_dir}"
+    [[ -d "${base}" ]] || return 1
+    resolved_base="$(cd "${base}" 2>/dev/null && pwd -P)" || return 1
+    if [[ "${rel_path}" == "/" ]]; then
+        target="${resolved_base}"
+    else
+        target="${resolved_base}${rel_path}"
+    fi
+    # O nó final pode ser um symlink; não seguimos symlink no último
+    # componente para podermos recusar explicitamente (ver checagem abaixo)
+    # em vez de silenciosamente resolver para fora do staging.
+    if [[ -L "${target}" ]]; then
+        return 2
+    fi
+    [[ -e "${target}" ]] || return 1
+    resolved_target="$(cd "$(dirname -- "${target}")" 2>/dev/null && pwd -P)/$(basename -- "${target}")" \
+        || return 1
+    if [[ "${resolved_target}" != "${resolved_base}" && "${resolved_target}" != "${resolved_base}"/* ]]; then
+        return 1
+    fi
+    if [[ -d "${resolved_target}" ]]; then
+        STAGING_RESOLVED_TYPE="d"
+    elif [[ -f "${resolved_target}" ]]; then
+        STAGING_RESOLVED_TYPE="f"
+    else
+        return 2
+    fi
+    STAGING_RESOLVED_PATH="${resolved_target}"
+    return 0
+}
+
 # Carrega apenas o necessário para operações read-only do HUB, sem mensagens
 # interativas em stdout. Qualquer detalhe de credencial/repositório fica fora
 # da resposta JSON pública.
@@ -1709,6 +1846,182 @@ run_hub_preflight() {
     printf '{"version":%d,"ok":true,"action":"preflight","snapshot":"%s","ready":%s,"item":{"type":"%s","token":"%s","size_bytes":%s},"space":{"available_mb":%d,"minimum_mb":%d,"required_mb":%d,"sufficient":%s}}\n' \
         "${HUB_API_VERSION}" "${snap}" "${ready}" "${actual}" "${token}" "${G_ITEM_SIZE}" \
         "${available_mb}" "${MIN_FREE_MB}" "${required_mb}" "${ready}"
+}
+
+# ---------------------------------------------------------------------------
+# NAVEGAÇÃO/METADADOS/DOWNLOAD DO STAGING DE UM JOB CONCLUÍDO (issue #10)
+# ---------------------------------------------------------------------------
+# Toda operação abaixo exige hub_staging_job_ready (status success, ainda
+# dentro do prazo) ANTES de decodificar o token ou tocar o filesystem — job
+# inexistente, running, failed ou expirado recebem o MESMO erro genérico
+# "job_not_ready", sem diferenciar o motivo real (evita oráculo de estado).
+
+hub_staging_prepare_job() {
+    local job_id="$1"
+    valid_job_id_selective "${job_id}" || { hub_json_error "invalid_job" "Identificador de job inválido."; return 1; }
+    hub_token_key >/dev/null || { hub_json_error "configuration_invalid" "Chave de tokens indisponível."; return 1; }
+    hub_staging_job_ready "${job_id}" || { hub_json_error "job_not_ready" "Job inexistente, ainda em execução, sem sucesso ou expirado."; return 1; }
+    return 0
+}
+
+run_hub_staging_list() {
+    local job_id="$1" token="${2:-}" data_dir rel_path="/" i name kind entry_token
+    local items="" count=0 truncated=false entries_tmp
+
+    hub_staging_prepare_job "${job_id}" || return 1
+    if [[ -n "${token}" ]]; then
+        if ! hub_decode_staging_token "${job_id}" "${token}"; then
+            hub_json_error "invalid_token" "Token inválido."
+            return 1
+        fi
+        rel_path="${G_SELECTED}"
+    fi
+
+    data_dir="$(hub_item_data_dir "${job_id}")"
+    if ! hub_staging_resolve "${data_dir}" "${rel_path}"; then
+        hub_json_error "item_not_found" "Item não encontrado no staging do job."
+        return 1
+    fi
+    [[ "${STAGING_RESOLVED_TYPE}" == "d" ]] || {
+        hub_json_error "not_a_directory" "O item não é um diretório."
+        return 1
+    }
+
+    entries_tmp="$(mktemp)" || { hub_json_error "internal_error" "Falha ao preparar listagem."; return 1; }
+    # find -maxdepth 1: só filhos diretos. "-print0" (portátil — funciona em
+    # GNU e BSD/macOS find; "-printf" é GNU-only) evita ambiguidade de nome
+    # com espaço/newline antes da leitura em bash; o tipo (d/f/l/outro) é
+    # decidido depois, por nó, com os testes -L/-d/-f do próprio bash.
+    if ! find "${STAGING_RESOLVED_PATH}" -mindepth 1 -maxdepth 1 -print0 > "${entries_tmp}" 2>/dev/null; then
+        rm -f "${entries_tmp}"
+        hub_json_error "staging_read_failed" "Falha ao ler o staging do job."
+        return 1
+    fi
+
+    while IFS= read -r -d '' child_path; do
+        name="$(basename -- "${child_path}")"
+        [[ ! "${name}" =~ [[:cntrl:]] ]] || continue
+        if [[ -L "${child_path}" ]]; then
+            continue  # symlink nunca é listado
+        elif [[ -d "${child_path}" ]]; then
+            kind="directory"
+        elif [[ -f "${child_path}" ]]; then
+            kind="file"
+        else
+            continue  # tipo especial (device, fifo, socket) nunca é listado
+        fi
+        if (( count >= HUB_NAV_LIMIT )); then
+            truncated=true
+            break
+        fi
+        local child_rel
+        if [[ "${rel_path}" == "/" ]]; then
+            child_rel="/${name}"
+        else
+            child_rel="${rel_path}/${name}"
+        fi
+        entry_token="$(hub_make_staging_token "${job_id}" "${child_rel}")" || {
+            rm -f "${entries_tmp}"
+            hub_json_error "token_generation_failed" "Falha ao proteger item do staging."
+            return 1
+        }
+        (( count > 0 )) && items+=","
+        items+="{\"name\":\"$(hub_json_escape "${name}")\",\"type\":\"${kind}\",\"token\":\"${entry_token}\"}"
+        ((count++))
+    done < "${entries_tmp}"
+    rm -f "${entries_tmp}"
+
+    printf '{"version":%d,"ok":true,"action":"staging-list","job_id":"%s","limit":%d,"truncated":%s,"items":[%s]}\n' \
+        "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "${HUB_NAV_LIMIT}" "${truncated}" "${items}"
+}
+
+# Soma recursiva do tamanho em bytes de um caminho já resolvido no disco
+# local (arquivo ou diretório). Usado só para reportar metadados — nunca para
+# decidir se algo pode ser lido (isso é hub_staging_resolve).
+hub_staging_local_size() {
+    local path="$1"
+    if [[ -f "${path}" ]]; then
+        stat -c '%s' "${path}" 2>/dev/null || stat -f '%z' "${path}" 2>/dev/null
+        return
+    fi
+    du -sk --apparent-size "${path}" 2>/dev/null | awk '{print $1 * 1024}' \
+        || du -sk "${path}" 2>/dev/null | awk '{print $1 * 1024}'
+}
+
+run_hub_staging_stat() {
+    local job_id="$1" token="$2" data_dir rel_path size_bytes kind
+
+    hub_staging_prepare_job "${job_id}" || return 1
+    if ! hub_decode_staging_token "${job_id}" "${token}"; then
+        hub_json_error "invalid_token" "Token inválido."
+        return 1
+    fi
+    rel_path="${G_SELECTED}"
+
+    data_dir="$(hub_item_data_dir "${job_id}")"
+    if ! hub_staging_resolve "${data_dir}" "${rel_path}"; then
+        hub_json_error "item_not_found" "Item não encontrado no staging do job."
+        return 1
+    fi
+
+    [[ "${STAGING_RESOLVED_TYPE}" == "d" ]] && kind="directory" || kind="file"
+    size_bytes="$(hub_staging_local_size "${STAGING_RESOLVED_PATH}")"
+    [[ "${size_bytes}" =~ ^[0-9]+$ ]] || {
+        hub_json_error "size_check_failed" "Não foi possível calcular o tamanho do item."
+        return 1
+    }
+
+    printf '{"version":%d,"ok":true,"action":"staging-stat","job_id":"%s","item":{"type":"%s","token":"%s","size_bytes":%s}}\n' \
+        "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "${kind}" "${token}" "${size_bytes}"
+}
+
+# Transmite o conteúdo do item em stdout: arquivo cru, ou diretório
+# empacotado sob demanda como tar (stream, nunca materializado num .tar.gz
+# intermediário em disco — "empacotar de forma transitória" da issue).
+# QUALQUER diagnóstico vai para stderr/log; stdout carrega só bytes do
+# conteúdo, para o HUB poder gravar o stdout direto num arquivo sem risco de
+# misturar uma mensagem de erro no meio dos bytes binários.
+run_hub_staging_download() {
+    local job_id="$1" token="$2" data_dir rel_path
+
+    # Validação própria, SEM hub_json_error: essa função escreve JSON no
+    # stdout, o mesmo canal usado aqui para bytes binários — usá-la
+    # contaminaria o stream de download com uma mensagem de erro. Qualquer
+    # recusa neste comando vai só para stderr/log (via error()), nunca para
+    # stdout, mesmo em caso de falha.
+    valid_job_id_selective "${job_id}" || { error "job_id inválido."; return 1; }
+    hub_token_key >/dev/null 2>>"${RESTORE_LOG_FILE}" || { error "Chave de tokens indisponível."; return 1; }
+    if ! hub_staging_job_ready "${job_id}" 2>>"${RESTORE_LOG_FILE}"; then
+        error "Job inexistente, ainda em execução, sem sucesso ou expirado."
+        return 1
+    fi
+    if ! hub_decode_staging_token "${job_id}" "${token}" 2>>"${RESTORE_LOG_FILE}"; then
+        error "Token de download inválido (job ${job_id})."
+        return 1
+    fi
+    rel_path="${G_SELECTED}"
+
+    data_dir="$(hub_item_data_dir "${job_id}")"
+    if ! hub_staging_resolve "${data_dir}" "${rel_path}" 2>>"${RESTORE_LOG_FILE}"; then
+        error "Item não encontrado no staging do job ${job_id}."
+        return 1
+    fi
+
+    if [[ "${STAGING_RESOLVED_TYPE}" == "f" ]]; then
+        # cat: sem transformação, sem carregar o arquivo inteiro em memória
+        # (kernel faz o streaming). Erros do próprio cat vão para stderr.
+        cat -- "${STAGING_RESOLVED_PATH}" 2>>"${RESTORE_LOG_FILE}"
+        return $?
+    fi
+
+    # Diretório: empacota como tar direto no stdout. -C entra no PAI do alvo
+    # e referencia só o nome final, então o tar contém um único diretório de
+    # topo com o nome do item (não o caminho absoluto do staging).
+    local parent_dir base_name
+    parent_dir="$(dirname -- "${STAGING_RESOLVED_PATH}")"
+    base_name="$(basename -- "${STAGING_RESOLVED_PATH}")"
+    tar -C "${parent_dir}" -cf - -- "${base_name}" 2>>"${RESTORE_LOG_FILE}"
+    return $?
 }
 
 hub_job_log_file()    { echo "${HUB_JOB_LOG_DIR}/${1}.log"; }
@@ -2182,6 +2495,13 @@ Uso:
   sudo restic-restore.sh --hub-cleanup [--job <job_id>]
                                     # remove staging(s) de item expirado(s);
                                     # com --job, exclusão antecipada de um job
+  sudo restic-restore.sh --hub-staging-list --job <job_id> [--token <token>]
+  sudo restic-restore.sh --hub-staging-stat --job <job_id> --token <token>
+                                    # API JSON read-only; navega/inspeciona o
+                                    # staging JÁ CONCLUÍDO de um job (issue #10)
+  sudo restic-restore.sh --hub-staging-download --job <job_id> --token <token>
+                                    # transmite o item em stdout: arquivo cru
+                                    # ou diretório empacotado como tar
 
 O script carrega /etc/restic/env (o mesmo do backup), abre o repositório no
 S3 e oferece um menu para restaurar arquivos, sites e bancos de dados de
@@ -2225,6 +2545,15 @@ main() {
             --hub-cleanup)
                 [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
                 mode="hub-cleanup"; shift ;;
+            --hub-staging-list)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-staging-list"; shift ;;
+            --hub-staging-stat)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-staging-stat"; shift ;;
+            --hub-staging-download)
+                [[ "${mode}" == "interactive" ]] || { echo "Modos incompatíveis" >&2; exit 1; }
+                mode="hub-staging-download"; shift ;;
             --snapshot)
                 [[ $# -ge 2 ]] || { echo "--snapshot exige um valor" >&2; exit 1; }
                 snap_arg="$2"; shift 2 ;;
@@ -2291,6 +2620,32 @@ main() {
             || { echo "--hub-cleanup só aceita --job" >&2; exit 1; }
         run_hub_cleanup "${job_arg}"
         return
+    fi
+
+    if [[ "${mode}" == "hub-staging-list" ]]; then
+        [[ -n "${job_arg}" ]] || { echo "--hub-staging-list exige --job <job_id>" >&2; exit 1; }
+        [[ -z "${snap_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
+        run_hub_staging_list "${job_arg}" "${token_arg}"
+        return
+    fi
+
+    if [[ "${mode}" == "hub-staging-stat" ]]; then
+        [[ -n "${job_arg}" && -n "${token_arg}" ]] \
+            || { echo "--hub-staging-stat exige --job <job_id> --token <token>" >&2; exit 1; }
+        [[ -z "${snap_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { hub_json_error "invalid_arguments" "Argumentos inválidos."; exit 1; }
+        run_hub_staging_stat "${job_arg}" "${token_arg}"
+        return
+    fi
+
+    if [[ "${mode}" == "hub-staging-download" ]]; then
+        [[ -n "${job_arg}" && -n "${token_arg}" ]] \
+            || { echo "--hub-staging-download exige --job <job_id> --token <token>" >&2; exit 1; }
+        [[ -z "${snap_arg}" && -z "${expected_type}" && -z "${nonce_arg}" ]] \
+            || { echo "Argumentos inválidos para --hub-staging-download" >&2; exit 1; }
+        run_hub_staging_download "${job_arg}" "${token_arg}"
+        exit $?
     fi
 
     # Flags de modos remotos nunca são ignoradas no menu interativo.

@@ -39,6 +39,17 @@
 #                                      24h — issue #9. Acompanhe com status/log.
 #   cleanup <job_id>                 → sudo restic-restore.sh --hub-cleanup ...
 #                                      (exclusão antecipada do staging do job)
+#   staging-list <job_id> [token]    → lista raiz ou um diretório do staging
+#                                      JÁ CONCLUÍDO do job (JSON v1, issue #10)
+#   staging-stat <job_id> <token>    → metadados (tipo, tamanho) de um item do
+#                                      staging do job
+#   staging-download <job_id> <token>
+#                                    → transmite o item em stdout: arquivo cru
+#                                      ou diretório empacotado como tar. Só
+#                                      jobs com status "success" e ainda
+#                                      dentro do prazo (24h) expõem conteúdo;
+#                                      job ativo, falho, expirado ou
+#                                      inexistente são recusados igualmente.
 #
 # Qualquer outra coisa (inclusive sessão vazia/interativa, comandos fora da
 # whitelist, ou snapshot_id/job_id fora do formato esperado) é recusada com
@@ -61,6 +72,9 @@ readonly HANDSHAKE_TIMEOUT_S=8
 SNAPSHOT_RE='^[0-9a-f]{8,64}$'
 JOB_RE='^[A-Za-z0-9-]{1,64}$'
 TOKEN_RE='^v1\.[A-Za-z0-9_-]+\.[0-9a-f]{64}$'
+# Prefixo "v1s" distingue token de staging (issue #10) de token de navegação
+# de snapshot (TOKEN_RE acima) — os dois nunca são intercambiáveis.
+STAGING_TOKEN_RE='^v1s\.[A-Za-z0-9_-]+\.[0-9a-f]{64}$'
 
 log_attempt() {
     logger -t hub-restore-shell -- "$*" 2>/dev/null || true
@@ -262,6 +276,38 @@ case "${action}" in
         [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
         log_attempt "cleanup job=${job}"
         exec sudo -n "${RESTORE_BIN}" --hub-cleanup --job "${job}"
+        ;;
+    staging-list)
+        (( ${#parts[@]} == 2 || ${#parts[@]} == 3 )) \
+            || reject "uso: staging-list <job_id> [token]"
+        job="${parts[1]}"
+        [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
+        log_attempt "staging-list job=${job} token=$(( ${#parts[@]} == 3 ? 1 : 0 ))"
+        if (( ${#parts[@]} == 3 )); then
+            token="${parts[2]}"
+            [[ "${token}" =~ ${STAGING_TOKEN_RE} ]] || reject "token em formato inválido"
+            exec sudo -n "${RESTORE_BIN}" --hub-staging-list --job "${job}" --token "${token}"
+        fi
+        exec sudo -n "${RESTORE_BIN}" --hub-staging-list --job "${job}"
+        ;;
+    staging-stat)
+        (( ${#parts[@]} == 3 )) || reject "uso: staging-stat <job_id> <token> — recebido: ${cmd}"
+        job="${parts[1]}"; token="${parts[2]}"
+        [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
+        [[ "${token}" =~ ${STAGING_TOKEN_RE} ]] || reject "token em formato inválido"
+        log_attempt "staging-stat job=${job}"
+        exec sudo -n "${RESTORE_BIN}" --hub-staging-stat --job "${job}" --token "${token}"
+        ;;
+    staging-download)
+        (( ${#parts[@]} == 3 )) || reject "uso: staging-download <job_id> <token> — recebido: ${cmd}"
+        job="${parts[1]}"; token="${parts[2]}"
+        [[ "${job}" =~ ${JOB_RE} ]] || reject "job_id inválido: ${job}"
+        [[ "${token}" =~ ${STAGING_TOKEN_RE} ]] || reject "token em formato inválido"
+        log_attempt "staging-download job=${job}"
+        # exec preserva o stdout deste processo como o do restic-restore.sh —
+        # sem isso (ex.: capturar em variável) o conteúdo binário passaria
+        # por bash antes de sair, arriscando corromper bytes NUL/controle.
+        exec sudo -n "${RESTORE_BIN}" --hub-staging-download --job "${job}" --token "${token}"
         ;;
     *)
         reject "comando fora da whitelist: ${cmd}"
