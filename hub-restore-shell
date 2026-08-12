@@ -17,9 +17,11 @@
 #   preflight <snapshot_id> <token> <file|directory>
 #                                    → valida item e espaço (JSON v1)
 #   restore-item <snapshot_id> <token> <job_id>
-#                                    → sudo restic-restore.sh --hub-restore-item ...
-#                                      (SÓ o item do token, staging isolado por
-#                                      job, expira em 24h — issue #9)
+#                                    → aceita e desacopla (setsid) o job;
+#                                      responde IMEDIATAMENTE {"ok":true,"job_id":...}
+#                                      sem esperar o Restic terminar. SÓ o item
+#                                      do token, staging isolado por job, expira
+#                                      em 24h — issue #9. Acompanhe com status/log.
 #   cleanup <job_id>                 → sudo restic-restore.sh --hub-cleanup ...
 #                                      (exclusão antecipada do staging do job)
 #
@@ -122,8 +124,25 @@ case "${action}" in
         [[ "${token}" =~ ${TOKEN_RE} ]]   || reject "token em formato inválido"
         [[ "${job}" =~ ${JOB_RE} ]]       || reject "job_id inválido: ${job}"
         log_attempt "restore-item snapshot=${snap} job=${job}"
-        exec sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
-            --token "${token}" --job "${job}"
+        # Desacoplado da sessão SSH de propósito: o Restic, uma vez iniciado,
+        # não é cancelável, então fechar a conexão não pode derrubá-lo.
+        # setsid cria uma nova sessão (imune a SIGHUP/SIGTERM do terminal que
+        # se desconectou); stdio vai só para dentro do sudo -n, que por sua
+        # vez tem RESTORE_LOG_FILE (job.log) como destino real via o próprio
+        # restic-restore.sh. A resposta ao cliente é imediata: só confirma
+        # que o job foi aceito, não espera o Restic terminar.
+        if command -v setsid >/dev/null 2>&1; then
+            setsid sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
+                --token "${token}" --job "${job}" \
+                </dev/null >/dev/null 2>&1 &
+        else
+            nohup sudo -n "${RESTORE_BIN}" --hub-restore-item --snapshot "${snap}" \
+                --token "${token}" --job "${job}" \
+                </dev/null >/dev/null 2>&1 &
+        fi
+        disown 2>/dev/null || true
+        printf '{"version":1,"ok":true,"action":"restore-item","job_id":"%s"}\n' "${job}"
+        exit 0
         ;;
     cleanup)
         (( ${#parts[@]} == 2 )) || reject "uso: cleanup <job_id> — recebido: ${cmd}"

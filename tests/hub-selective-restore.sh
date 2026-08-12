@@ -24,6 +24,7 @@ ITEM_STAGING_DIR="${TMP_DIR}/items"
 LOCK_FILE="${TMP_DIR}/job.lock"
 OUT_FILE="${TMP_DIR}/stdout"
 ERR_FILE="${TMP_DIR}/stderr"
+INCLUDE_LOG="${TMP_DIR}/restore.includes"
 
 SNAPSHOT="01234567"
 TOKEN_KEY_HEX="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -92,6 +93,7 @@ run_restore() {
         MOCK_DF_LOG="${DF_LOG}" \
         MOCK_SUDO_LOG="${SUDO_LOG}" \
         MOCK_LOGGER_LOG="${LOGGER_LOG}" \
+        MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
         "${RESTORE_COPY}" "$@" >"${OUT_FILE}" 2>"${ERR_FILE}"
     RUN_RC=$?
 }
@@ -167,11 +169,23 @@ case "$1" in
             /diretorio)
                 echo '{"struct_type":"node","path":"/diretorio","type":"dir","size":0}'
                 ;;
+            '/nome[esquisito]*.txt')
+                echo '{"struct_type":"node","path":"/nome[esquisito]*.txt","type":"file","size":7}'
+                ;;
             *) exit 1 ;;
         esac
         ;;
     restore)
         [[ "$#" -ge 5 && "$3" == "--target" ]] || exit 95
+        # Grava o --include literal recebido, para o teste de glob confirmar
+        # que o caminho foi escapado antes de chegar ao Restic (senão um
+        # padrão como '*' casaria outros itens do snapshot).
+        for ((i = 1; i <= $#; i++)); do
+            if [[ "${!i}" == "--include" ]]; then
+                j=$((i + 1))
+                printf '%s\n' "${!j}" >> "${MOCK_INCLUDE_LOG:-/dev/null}"
+            fi
+        done
         exit 0
         ;;
     *) exit 94 ;;
@@ -204,11 +218,12 @@ chmod +x "${MOCK_BIN}/restic" "${MOCK_BIN}/df" "${MOCK_BIN}/logger"
 # validação de job_id) não dependem de flock e continuam rodando.
 HAVE_FLOCK=1
 command -v flock >/dev/null 2>&1 || HAVE_FLOCK=0
-: > "${CALL_LOG}"; : > "${DF_LOG}"; : > "${LOGGER_LOG}"
+: > "${CALL_LOG}"; : > "${DF_LOG}"; : > "${LOGGER_LOG}"; : > "${INCLUDE_LOG}"
 
 TOKEN_FILE="$(token_for_path "${SNAPSHOT}" "/arquivo.txt")"
 TOKEN_DIR="$(token_for_path "${SNAPSHOT}" "/diretorio")"
 TOKEN_MISSING="$(token_for_path "${SNAPSHOT}" "/nao-existe")"
+TOKEN_GLOB="$(token_for_path "${SNAPSHOT}" '/nome[esquisito]*.txt')"
 
 if (( HAVE_FLOCK )); then
     # 1. Arquivo: materializa só o item, meta.json completo, staging isolado.
@@ -258,8 +273,20 @@ if (( HAVE_FLOCK )); then
     assert_contains "${ITEM_STAGING_DIR}/job-resticfail-1/meta.json" '"status":"failed restic restore' "meta de falha do restic"
     [[ -d "${ITEM_STAGING_DIR}/job-resticfail-1" ]] || fail "staging da falha deve ser preservado para auditoria"
     pass "falha do Restic termina em failed auditável, staging preservado"
+
+    # 11. Nome com metacaracteres de glob do Restic (* ? [ ]): o --include
+    # recebido pelo restic precisa ser o caminho ESCAPADO (literal), senão um
+    # '*' ou '[...]' no nome real casaria outros itens do snapshot.
+    : > "${INCLUDE_LOG}"
+    run_restore --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_GLOB}" --job job-glob-1
+    assert_eq "0" "${RUN_RC}" "restauração de item com metacaracteres de glob no nome"
+    assert_eq "file" "$(json_field "${ITEM_STAGING_DIR}/job-glob-1/meta.json" item_type)" "item_type (glob)"
+    assert_eq '/nome[esquisito]*.txt' "$(json_field "${ITEM_STAGING_DIR}/job-glob-1/meta.json" path)" "path persistido sem escape (glob)"
+    assert_contains "${INCLUDE_LOG}" '/nome\[esquisito\]\*.txt' "--include recebido pelo restic deve estar escapado"
+    grep -qF '/nome[esquisito]*.txt' "${INCLUDE_LOG}" && fail "--include não pode chegar ao restic sem escape (viraria glob real)"
+    pass "item com * ? [ ] no nome é passado ao restic como padrão literal (escapado), só o item exato é materializado"
 else
-    echo "# aviso: 'flock' ausente neste sistema — pulando cenários 1-6 e 9 (execução real de --hub-restore-item)." >&2
+    echo "# aviso: 'flock' ausente neste sistema — pulando cenários 1-6, 9 e 11 (execução real de --hub-restore-item)." >&2
 fi
 
 # 7. Queda do cliente a meio caminho: job sem meta.json (SSH caiu antes do
@@ -300,5 +327,117 @@ run_restore --hub-cleanup --job "../../etc"
 [[ "${RUN_RC}" -ne 0 ]] || fail "job_id com traversal deveria ser recusado"
 [[ -d "${ROOT_DIR}" ]] || fail "sanity: ROOT_DIR deveria continuar intacto"
 pass "--hub-cleanup recusa job_id fora do formato, sem aceitar caminho arbitrário"
+
+# 12. Corrida cleanup vs restore: job com status "running" e lock global
+# ocupado (simula um restore-item de fato em andamento) não pode ser
+# removido — nem por exclusão antecipada, nem pela varredura de expirados.
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p "${ITEM_STAGING_DIR}/job-running-1"
+    cat > "${ITEM_STAGING_DIR}/job-running-1/meta.json" <<JSON
+{"version":1,"job_id":"job-running-1","snapshot":"${SNAPSHOT}","path":"/arquivo.txt","item_type":"file","status":"running","created_at":1,"expires_at":1}
+JSON
+    # Segura o MESMO lock global que run_hub_restore_item usa, num processo em
+    # background, para simular um job realmente em execução. HOLD_SENTINEL só
+    # é criado DEPOIS do flock ter sucesso — barreira determinística, sem
+    # depender de polling que competiria pelo próprio lock e distorceria o
+    # timing. `flock 8 -c 'sleep N'` (em vez de `flock 8; sleep N` em
+    # comandos separados) garante que o processo que segura o lock e o que
+    # dorme são o MESMO PID — sem isso, alguns bashes bifurcam `sleep` como
+    # filho separado, e matar só o PID capturado deixa esse filho órfão
+    # segurando o fd do lock (visto na prática: o wait/kill do PID pai
+    # retornava, mas lsof ainda mostrava um `sleep` distinto com o fd aberto).
+    HOLD_SENTINEL="${TMP_DIR}/holder.locked"
+    rm -f "${HOLD_SENTINEL}"
+    flock 8 -c ": > '${HOLD_SENTINEL}'; sleep 2" 8>"${LOCK_FILE}" &
+    HOLDER_PID=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [[ -f "${HOLD_SENTINEL}" ]] && break
+        sleep 0.1
+    done
+    [[ -f "${HOLD_SENTINEL}" ]] || fail "holder não conseguiu segurar o lock a tempo (setup do teste)"
+
+    run_restore --hub-cleanup --job job-running-1
+    [[ "${RUN_RC}" -ne 0 ]] || fail "cleanup não deveria remover job com lock ocupado (running)"
+    [[ -d "${ITEM_STAGING_DIR}/job-running-1" ]] || fail "staging do job running foi removido durante corrida com cleanup"
+
+    # Espera o holder terminar sozinho (sleep 2, curto e determinístico) em
+    # vez de tentar matá-lo — evita toda a categoria de problema de processos
+    # filhos órfãos ainda segurando o fd do lock.
+    wait "${HOLDER_PID}" 2>/dev/null || true
+    LOCK_FREE=0
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if flock -n "${LOCK_FILE}" -c true 2>/dev/null; then
+            LOCK_FREE=1
+            break
+        fi
+        sleep 0.2
+    done
+    (( LOCK_FREE )) || fail "lock não foi liberado a tempo após o holder terminar (setup do teste)"
+
+    # Expirado (created_at antigo) mas ainda "running" com lock livre agora:
+    # a limpeza revalida o status DEPOIS de adquirir o lock e ainda recusa,
+    # porque o meta.json continua dizendo running.
+    run_restore --hub-cleanup --job job-running-1
+    [[ "${RUN_RC}" -ne 0 ]] || fail "cleanup não deveria remover job com status running, mesmo com lock livre"
+    [[ -d "${ITEM_STAGING_DIR}/job-running-1" ]] || fail "staging do job running não deveria ser removido enquanto status=running"
+    pass "limpeza durante job ativo (lock ocupado ou status running) é recusada"
+else
+    echo "# aviso: 'flock' ausente — pulando cenário 12 (corrida cleanup vs restore)." >&2
+fi
+
+# 13. Falha de env (RESTIC_ENV_FILE ausente): meta.json termina em failed,
+# nunca fica preso em running — cobre load_env_file_safe/validate_env_safe
+# (variantes que retornam erro em vez de matar o processo com die).
+if (( HAVE_FLOCK )); then
+    # A env real é passada via RESTIC_ENV_FILE; para simular falha, chamamos
+    # diretamente com RESTIC_ENV_FILE apontando para um arquivo inexistente.
+    : > "${OUT_FILE}"; : > "${ERR_FILE}"
+    env \
+        PATH="${MOCK_BIN}:${PATH}" \
+        RESTIC_ENV_FILE="${TMP_DIR}/env-que-nao-existe" \
+        RESTORE_LOG_FILE="${RESTORE_LOG}" \
+        RESTIC_RESTORE_ALLOW_NONROOT=1 \
+        MOCK_CALL_LOG="${CALL_LOG}" \
+        MOCK_DF_LOG="${DF_LOG}" \
+        MOCK_SUDO_LOG="${SUDO_LOG}" \
+        MOCK_LOGGER_LOG="${LOGGER_LOG}" \
+        MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
+        "${RESTORE_COPY}" --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_FILE}" --job job-envfail-2 \
+        >"${OUT_FILE}" 2>"${ERR_FILE}"
+    RUN_RC=$?
+    assert_eq "1" "${RUN_RC}" "falha de env deve retornar rc != 0"
+    [[ -f "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" ]] || fail "meta.json ausente após falha de env"
+    assert_contains "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" '"status":"failed env' "meta de falha de env"
+    grep -qF '"status":"running"' "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" \
+        && ! grep -qF '"status":"failed' "${ITEM_STAGING_DIR}/job-envfail-2/meta.json" \
+        && fail "job de falha de env não pode ficar preso em running"
+    pass "falha simulada de env deixa meta.json em failed, nunca preso em running"
+fi
+
+# 14. Queda do cliente durante a restauração: run_hub_restore_item não deve
+# depender de stdin/sessão viva para terminar — roda até o fim mesmo com
+# stdin fechado desde o início (equivalente a uma sessão SSH que caiu antes
+# do job iniciar de verdade) e ainda assim persiste um resultado auditável.
+if (( HAVE_FLOCK )); then
+    : > "${OUT_FILE}"; : > "${ERR_FILE}"
+    env \
+        PATH="${MOCK_BIN}:${PATH}" \
+        RESTIC_ENV_FILE="${ENV_FILE}" \
+        RESTORE_LOG_FILE="${RESTORE_LOG}" \
+        RESTIC_RESTORE_ALLOW_NONROOT=1 \
+        MOCK_CALL_LOG="${CALL_LOG}" \
+        MOCK_DF_LOG="${DF_LOG}" \
+        MOCK_SUDO_LOG="${SUDO_LOG}" \
+        MOCK_LOGGER_LOG="${LOGGER_LOG}" \
+        MOCK_INCLUDE_LOG="${INCLUDE_LOG}" \
+        "${RESTORE_COPY}" --hub-restore-item --snapshot "${SNAPSHOT}" --token "${TOKEN_DIR}" --job job-clientdrop-1 \
+        </dev/null >"${OUT_FILE}" 2>"${ERR_FILE}"
+    RUN_RC=$?
+    assert_eq "0" "${RUN_RC}" "job com stdin fechado (sessão caída) deve terminar normalmente"
+    assert_eq "success" "$(json_field "${ITEM_STAGING_DIR}/job-clientdrop-1/meta.json" status)" "status final (sessão caída)"
+    [[ "$(json_field "${ITEM_STAGING_DIR}/job-clientdrop-1/meta.json" finished_at)" -gt 0 ]] \
+        || fail "finished_at ausente/zero após conclusão"
+    pass "job não depende de stdin/sessão viva — sobrevive à queda do cliente e termina auditável"
+fi
 
 echo "${PASS_COUNT} verificações OK."
