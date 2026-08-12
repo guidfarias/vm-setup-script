@@ -252,6 +252,14 @@ OUTSIDE_FILE="${TMP_DIR}/fora-do-staging.txt"
 printf 'nao pode vazar' > "${OUTSIDE_FILE}"
 ln -s "${OUTSIDE_FILE}" "${READY_DATA}/link-externo"
 ln -s "${READY_DATA}/pequeno.txt" "${READY_DATA}/link-interno"
+# Symlink em componente INTERMEDIÁRIO do caminho (não no nó final): um
+# diretório dentro do staging que é, na verdade, um link para fora dele.
+# hub_staging_resolve precisa recusar mesmo quando só o meio do caminho
+# escapa, não só quando o próprio nó pedido é um link.
+OUTSIDE_DIR="${TMP_DIR}/fora-do-staging-dir"
+mkdir -p "${OUTSIDE_DIR}"
+printf 'vazou via componente intermediario' > "${OUTSIDE_DIR}/segredo.txt"
+ln -s "${OUTSIDE_DIR}" "${READY_DATA}/elo-intermediario"
 
 # --- Jobs em outros estados ---------------------------------------------
 
@@ -367,6 +375,20 @@ run_restore --hub-staging-stat --job "${READY_JOB}" --token "${TOKEN_LINK_INT}"
 assert_error_json "item_not_found" "symlink interno recusado no stat"
 pass "symlink externo e interno nunca são lidos, mesmo com token forjado no mesmo esquema"
 
+# 8b. Symlink em componente INTERMEDIÁRIO do caminho (não no nó final): o
+# alvo pedido (.../elo-intermediario/segredo.txt) tem um arquivo real no
+# fim, mas o diretório pai é um link para fora do staging. A validação por
+# pathname (cd + pwd -P) segue esse link ao resolver — precisa recusar antes
+# de qualquer leitura, e o conteúdo nunca pode aparecer em stdout.
+TOKEN_ELO_INTERMEDIARIO="$(token_for_rel_path "${READY_JOB}" "/elo-intermediario/segredo.txt")"
+run_restore --hub-staging-stat --job "${READY_JOB}" --token "${TOKEN_ELO_INTERMEDIARIO}"
+assert_error_json "item_not_found" "symlink em componente intermediário recusado no stat"
+run_restore --hub-staging-download --job "${READY_JOB}" --token "${TOKEN_ELO_INTERMEDIARIO}"
+[[ "${RUN_RC}" -ne 0 ]] || fail "download via symlink intermediário deveria falhar"
+assert_empty "${OUT_FILE}" "symlink intermediário não pode vazar conteúdo em stdout"
+assert_not_contains "${OUT_FILE}" "vazou via componente intermediario" "conteúdo atrás do link intermediário não pode aparecer no stdout"
+pass "symlink em componente intermediário do caminho (não só o nó final) é recusado, sem vazar conteúdo"
+
 # 9. Traversal (../) e caminho absoluto fora do staging são recusados antes
 # de qualquer leitura — o token nem decodifica.
 run_restore --hub-staging-stat --job "${READY_JOB}" --token "$(token_for_rel_path "${READY_JOB}" "/../fora-do-staging.txt")"
@@ -464,6 +486,139 @@ done
 after_sudo="$(wc -l < "${SUDO_LOG}" | tr -d ' ')"
 assert_eq "${before_sudo}" "${after_sudo}" "comandos de staging proibidos não podem alcançar sudo"
 pass "forced command recusa staging-list/stat/download malformados antes de alcançar sudo"
+
+# --- Sinal durante o stream e corrida cleanup-vs-leitura -----------------
+
+HAVE_FLOCK=1
+command -v flock >/dev/null 2>&1 || HAVE_FLOCK=0
+
+# Job dedicado a este cenário (não reaproveita READY_JOB, que a esta altura
+# já foi apagado/recriado por cenários anteriores e teria só pequeno.txt).
+TERM_JOB="job-term-1"
+write_meta "${TERM_JOB}" "success" "${future}"
+TERM_DATA="${ITEM_STAGING_DIR}/${TERM_JOB}/data"
+mkdir -p "${TERM_DATA}"
+head -c 5000000 /dev/urandom > "${TERM_DATA}/grande.bin" 2>/dev/null \
+    || dd if=/dev/zero of="${TERM_DATA}/grande.bin" bs=1024 count=4883 2>/dev/null
+TOKEN_TERM_GRANDE="$(token_for_rel_path "${TERM_JOB}" "/grande.bin")"
+
+# 17. TERM durante o download não pode injetar texto no meio do stream: a
+# flag HUB_STDOUT_IS_BINARY faz o trap de sinal (topo de restaurar_backup.sh)
+# escrever só em stderr/log quando ativa. Para garantir determinismo (não
+# depender da velocidade do disco terminar antes do kill), o stdout do
+# processo é escrito num FIFO cujo leitor consome DEVAGAR (1 byte por vez,
+# com sleep) — isso aplica backpressure real no pipe e mantém o `cat`/`tar`
+# de dentro de run_hub_staging_download genuinamente bloqueado no meio da
+# escrita até o sinal chegar, sem alterar o código de produção.
+FIFO_PATH="${TMP_DIR}/download.fifo"
+rm -f "${FIFO_PATH}"
+mkfifo "${FIFO_PATH}"
+: > "${OUT_FILE}"; : > "${ERR_FILE}"
+(
+    # dd (não `read` do bash) para não corromper bytes binários — bash
+    # `read` é orientado a linha/delimitador e não é seguro para dados
+    # arbitrários (NUL, sequências que colidem com o delimitador). Blocos de
+    # 4KB com uma pausa entre cada leitura aplicam a mesma backpressure sem
+    # arriscar a integridade do conteúdo. O loop para quando um bloco lido
+    # tem 0 bytes (EOF do FIFO) — o rc de `dd` sozinho não distingue isso.
+    CHUNK="${TMP_DIR}/download.chunk"
+    while true; do
+        dd if="${FIFO_PATH}" bs=4096 count=1 of="${CHUNK}" 2>/dev/null
+        [[ -s "${CHUNK}" ]] || break
+        cat "${CHUNK}" >> "${OUT_FILE}"
+        sleep 0.02
+    done
+) &
+READER_PID=$!
+env \
+    PATH="${MOCK_BIN}:${PATH}" \
+    RESTIC_ENV_FILE="${ENV_FILE}" \
+    RESTORE_LOG_FILE="${RESTORE_LOG}" \
+    RESTIC_RESTORE_ALLOW_NONROOT=1 \
+    "${RESTORE_COPY}" --hub-staging-download --job "${TERM_JOB}" --token "${TOKEN_TERM_GRANDE}" \
+    >"${FIFO_PATH}" 2>"${ERR_FILE}" &
+DOWNLOAD_PID=$!
+# Espera o arquivo de saída começar a crescer (prova que o leitor devagar já
+# está drenando o FIFO e o cat/tar de dentro do download está bloqueado na
+# escrita) antes de mandar o sinal.
+GREW=0
+for _ in $(seq 1 100); do
+    if [[ -s "${OUT_FILE}" ]]; then
+        GREW=1
+        break
+    fi
+    sleep 0.05
+done
+[[ "${GREW}" == "1" ]] || fail "leitor devagar do FIFO não recebeu nenhum byte a tempo (setup do teste de TERM)"
+kill -TERM "${DOWNLOAD_PID}" 2>/dev/null || true
+# Watchdog: se o TERM não derrubar o processo rapidamente (não deveria
+# acontecer — write() bloqueado é interrompido pelo sinal — mas evita travar
+# o teste indefinidamente se algo no ambiente se comportar diferente), força
+# com KILL depois de uma folga curta.
+( sleep 5; kill -KILL "${DOWNLOAD_PID}" 2>/dev/null || true ) &
+WATCHDOG_PID=$!
+wait "${DOWNLOAD_PID}" 2>/dev/null
+kill "${WATCHDOG_PID}" 2>/dev/null || true
+wait "${WATCHDOG_PID}" 2>/dev/null || true
+# Não há um jeito portátil e rápido de sinalizar EOF ao leitor devagar sem
+# arriscar travar o teste (o writer já morreu; reabrir o FIFO para fechar em
+# seguida nem sempre acorda um `read` bloqueado a tempo em todo shell). Como
+# o que importa já foi capturado em OUT_FILE no momento do kill, o leitor é
+# encerrado diretamente — ele é um subshell descartável deste cenário, sem
+# nenhum estado que precise de finalização graciosa.
+kill -KILL "${READER_PID}" 2>/dev/null || true
+wait "${READER_PID}" 2>/dev/null || true
+rm -f "${FIFO_PATH}"
+assert_not_contains "${OUT_FILE}" "Interrompido pelo usuário" "TERM durante o stream não pode injetar aviso no stdout binário"
+assert_not_contains "${OUT_FILE}" "AVISO" "TERM durante o stream não pode injetar tag de log no stdout binário"
+head -c "$(wc -c < "${OUT_FILE}" | tr -d ' ')" "${TERM_DATA}/grande.bin" > "${TMP_DIR}/expected-prefix"
+cmp -s "${OUT_FILE}" "${TMP_DIR}/expected-prefix" \
+    || fail "bytes recebidos antes do TERM não são um prefixo exato do arquivo original (stream contaminado)"
+pass "sinal TERM recebido durante o streaming de download não contamina o stdout binário"
+
+# 18. Corrida cleanup vs leitura: um leitor (staging-download) segurando o
+# lock COMPARTILHADO deve bloquear um cleanup concorrente (lock exclusivo)
+# até o leitor soltar — prova que a exclusão mútua kernel-level (flock) está
+# de fato em vigor, não só documentada. Mesmo padrão de sincronização
+# determinística de tests/hub-selective-restore.sh (cenário 12): um processo
+# em background segura o lock e sinaliza via arquivo sentinela, sem polling
+# que competiria pelo próprio lock.
+if (( HAVE_FLOCK )); then
+    HOLD_SENTINEL="${TMP_DIR}/staging-holder.locked"
+    RELEASE_SENTINEL="${TMP_DIR}/staging-holder.release"
+    rm -f "${HOLD_SENTINEL}" "${RELEASE_SENTINEL}"
+    (
+        exec 9>"${LOCK_FILE}"
+        flock -s 9
+        : > "${HOLD_SENTINEL}"
+        while [[ ! -f "${RELEASE_SENTINEL}" ]]; do sleep 0.05; done
+    ) &
+    HOLDER_PID=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [[ -f "${HOLD_SENTINEL}" ]] && break
+        sleep 0.1
+    done
+    [[ -f "${HOLD_SENTINEL}" ]] || fail "holder do lock compartilhado não conseguiu segurar o lock a tempo (setup do teste)"
+
+    run_restore --hub-cleanup --job "${READY_JOB}"
+    [[ "${RUN_RC}" -ne 0 ]] || fail "cleanup não deveria remover staging com uma leitura (lock compartilhado) em andamento"
+    [[ -d "${ITEM_STAGING_DIR}/${READY_JOB}" ]] || fail "staging foi removido durante corrida com leitura ativa"
+
+    : > "${RELEASE_SENTINEL}"
+    wait "${HOLDER_PID}" 2>/dev/null || true
+
+    run_restore --hub-cleanup --job "${READY_JOB}"
+    assert_eq "0" "${RUN_RC}" "cleanup após o leitor soltar o lock deve suceder"
+    [[ ! -d "${ITEM_STAGING_DIR}/${READY_JOB}" ]] || fail "cleanup não removeu o staging depois do lock liberado"
+    pass "cleanup concorrente com uma leitura ativa (lock compartilhado) é recusado; após liberar, cleanup sucede"
+
+    # Recria o job pronto de novo — os cenários acima consumiram-no.
+    write_meta "${READY_JOB}" "success" "${future}"
+    mkdir -p "${READY_DATA}"
+    printf 'conteudo pequeno' > "${READY_DATA}/pequeno.txt"
+else
+    echo "# aviso: 'flock' ausente neste sistema — pulando cenário de corrida cleanup-vs-leitura." >&2
+fi
 
 bash -n "${ROOT_DIR}/restaurar_backup.sh" || fail "bash -n restaurar_backup.sh"
 bash -n "${ROOT_DIR}/hub-restore-shell" || fail "bash -n hub-restore-shell"

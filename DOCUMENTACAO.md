@@ -590,10 +590,42 @@ para outro job.
 **Confinamento ao staging do job.** Todo caminho recebido é resolvido com
 `realpath` (symlinks seguidos) e precisa continuar estritamente dentro do
 `data/` do job depois de resolvido — symlink apontando para fora (mesmo que
-interno ao próprio staging, apontando para outro arquivo dele) e qualquer
+interno ao próprio staging, apontando para outro arquivo dele), symlink em
+um componente **intermediário** do caminho (não só no nó final) e qualquer
 traversal são recusados antes de qualquer leitura. Essa é a segunda camada
 de defesa: a primeira já recusa `..`, `//` e caracteres de controle na forma
 textual do token, antes mesmo de tocar o disco.
+
+**Lock compartilhado contra corrida com o cleanup.** `staging-list`,
+`staging-stat` e `staging-download` seguram o mesmo lock global da
+restauração seletiva (issue #9), mas em modo **compartilhado**
+(`flock -s`) — vários leitores podem coexistir, porém nenhum coexiste com o
+lock **exclusivo** que `cleanup`/a varredura de expiração adquirem antes do
+`rm -rf`. O lock é mantido do início da validação até o fim da
+leitura/streaming; se não for possível obtê-lo em 5s (outro comando com o
+lock exclusivo em mãos), a operação é recusada (`staging_locked` ou erro em
+stderr, fail-closed) em vez de ler sem proteção. Isso fecha a corrida em que
+um `cleanup` concorrente apagaria ou truncaria o staging no meio de uma
+leitura em andamento.
+
+**Abertura por descritor, não por nome.** Depois de validar o caminho,
+`hub_staging_resolve` abre um descritor sobre o alvo e, em Linux (sempre no
+servidor de produção; verificado via `/proc/self/fd`), confirma que esse
+descritor aponta exatamente para o caminho já validado — fechando a janela
+entre a checagem e a abertura real. `staging-download` de um arquivo lê
+diretamente desse descritor (nunca reabre o caminho por nome). Empacotar um
+diretório como `tar` ainda precisa de um caminho (não de um descritor) para
+preservar o nome do item como diretório de topo do artefato; nesse caso a
+proteção é o lock compartilhado acima, que impede qualquer alteração
+concorrente do conteúdo enquanto o `tar` roda. Em plataformas sem
+`/proc/self/fd` (fora do alvo de produção), a verificação por descritor é
+pulada e a proteção fica só na validação de caminho e no lock.
+
+**Sinal durante o download não contamina o stream.** Um `TERM`/`INT`
+recebido enquanto `staging-download` está transmitindo não pode injetar
+texto (aviso de "interrompido") no meio dos bytes binários já em stdout — o
+trap de sinal do processo verifica um sinalizador interno e, durante o
+download, escreve exclusivamente em stderr/log, nunca em stdout.
 
 **Exclusão antecipada.** Não há um comando novo para isso — `cleanup
 <job_id>` (o mesmo do restore seletivo, issue #9) já remove o staging

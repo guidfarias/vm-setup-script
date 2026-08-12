@@ -122,11 +122,22 @@ G_PATHS=(); G_TYPES=(); G_SIZES=()
 G_SELECTED=""
 G_ITEM_TYPE=""; G_ITEM_SIZE=""
 
+# Ligado só durante run_hub_staging_download, do início da validação até o
+# fim do cat/tar — enquanto ativo, stdout carrega SÓ bytes do conteúdo
+# (critério de aceite "logs e erros nunca entram no stream binário"). Os
+# handlers de EXIT/INT/TERM abaixo checam esta flag antes de qualquer echo
+# em stdout: um sinal recebido no meio do cat/tar não pode injetar texto no
+# meio dos bytes que já foram (ou estão sendo) escritos.
+HUB_STDOUT_IS_BINARY=false
+
 cleanup() {
     # Apaga SOMENTE os arquivos temporários de credenciais. O staging com o
     # material restaurado fica — ele é o produto da restauração.
     [[ -n "${MYSQL_DEFAULTS_FILE}" ]] && rm -f "${MYSQL_DEFAULTS_FILE}"
     [[ -n "${PGPASS_FILE}" ]]        && rm -f "${PGPASS_FILE}"
+    if [[ "${HUB_STDOUT_IS_BINARY}" == "true" ]]; then
+        return
+    fi
     if [[ -n "${STAGING_DIR}" && -d "${STAGING_DIR}" ]]; then
         echo
         echo "Arquivos restaurados/preventivos mantidos em: ${STAGING_DIR}"
@@ -134,7 +145,13 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-trap 'echo; warn "Interrompido pelo usuário."; exit 130' INT TERM
+trap '
+    if [[ "${HUB_STDOUT_IS_BINARY}" == "true" ]]; then
+        log_line "WARN" "Interrompido pelo usuário durante download de staging."
+        exit 130
+    fi
+    echo; warn "Interrompido pelo usuário."; exit 130
+' INT TERM
 
 # ---------------------------------------------------------------------------
 # LOG / SAÍDA
@@ -1557,14 +1574,20 @@ hub_decode_staging_token() {
 # ou falha se o meta.json não existe/não é JSON válido. status_word é só a
 # PRIMEIRA palavra do campo status (ex.: "failed algo" vira "failed") —
 # suficiente para diferenciar running/success/failed sem vazar o motivo.
-# Um único processo Perl (não dois) mantém o custo de "job inexistente"
-# (falha no -f, sem spawn) e "job existente mas não pronto" (um spawn) mais
-# próximos entre si — reduz, sem eliminar, o canal de timing entre os dois
-# casos que hub_staging_job_ready mascara com a mesma mensagem de erro.
+# SEMPRE spawna o mesmo processo Perl, mesmo quando meta.json não existe
+# (lê /dev/null nesse caso, o eval falha e cai no mesmo "exit 1" de um JSON
+# inválido) — mantém o custo de "job inexistente" e "job existente mas não
+# pronto" no mesmo caminho de código, para não abrir um canal de timing
+# observável entre os dois casos que hub_staging_job_ready mascara com a
+# mesma mensagem de erro.
 hub_staging_job_state() {
-    local job_id="$1" meta result
+    local job_id="$1" meta input result
     meta="$(hub_item_meta_file "${job_id}")"
-    [[ -f "${meta}" ]] || return 1
+    if [[ -f "${meta}" ]]; then
+        input="${meta}"
+    else
+        input="/dev/null"
+    fi
     result="$(perl -MJSON::PP -e '
         local $/; my $d = eval { decode_json(<STDIN>) };
         exit 1 if $@ || ref($d) ne "HASH";
@@ -1573,7 +1596,7 @@ hub_staging_job_state() {
         my $e = $d->{expires_at} // "";
         exit 1 if $s eq "" || $e !~ /^\d+$/;
         print "$s $e";
-    ' < "${meta}" 2>/dev/null)" || return 1
+    ' < "${input}" 2>/dev/null)" || return 1
     [[ "${result}" =~ ^[^\ ]+\ [0-9]+$ ]] || return 1
     printf '%s' "${result}"
 }
@@ -1581,15 +1604,17 @@ hub_staging_job_state() {
 # Só jobs "success" e ainda dentro do prazo expõem conteúdo. Job inexistente,
 # running, failed ou expirado são todos recusados da mesma forma — o cliente
 # não aprende qual desses é o caso real (evita reconhecimento de estado
-# interno via oráculo de erro).
+# interno via oráculo de erro). SEMPRE chama `date` (mesmo quando o estado já
+# reprovou por status), pelo mesmo motivo de hub_staging_job_state: manter o
+# custo uniforme entre os casos reduz o canal de timing residual.
 hub_staging_job_ready() {
-    local job_id="$1" state status expires now
-    state="$(hub_staging_job_state "${job_id}")" || return 1
+    local job_id="$1" state status expires now ok
+    state="$(hub_staging_job_state "${job_id}")" || state="unknown 0"
     read -r status expires <<< "${state}"
-    [[ "${status}" == "success" ]] || return 1
+    [[ "${status}" == "success" ]] && ok=0 || ok=1
     now="$(date +%s)"
-    (( now < expires )) || return 1
-    return 0
+    (( now < expires )) || ok=1
+    return "${ok}"
 }
 
 # Resolve <data_dir>/<rel_path> para um caminho REAL (realpath, symlinks
@@ -1597,10 +1622,27 @@ hub_staging_job_ready() {
 # resolvido. Recusa symlink apontando para fora, ".." e qualquer traversal
 # que o realpath exponha — hub_path_is_safe já bloqueia ".."/"//" na forma
 # textual do token, isto é a segunda camada, contra o conteúdo real do disco.
-# Define STAGING_RESOLVED_PATH e STAGING_RESOLVED_TYPE (f|d) em caso de êxito.
+#
+# TOCTOU: depois de validar o PATHNAME, esta função ABRE um descritor (fd 11)
+# sobre o alvo e, quando /proc/self/fd existe (Linux — sempre no servidor
+# alvo), confere que o fd aberto aponta exatamente para o mesmo caminho já
+# validado. Isso fecha a janela entre a checagem `-e`/`pwd -P` e a abertura
+# real: uma troca do nó por symlink nesse intervalo faria o fd resolver para
+# outro caminho, e a checagem abaixo recusa antes de qualquer leitura. Os
+# consumidores (list/stat/download) devem ler a PARTIR DESTE FD (arquivo:
+# `<&${STAGING_RESOLVED_FD}`; diretório: `/proc/self/fd/${STAGING_RESOLVED_FD}`
+# como -C do tar/alvo do find) em vez de reabrir STAGING_RESOLVED_PATH por
+# nome — reabrir por nome reintroduziria a mesma corrida que o fd fecha.
+# Em plataformas sem /proc/self/fd (ex.: BSD/macOS, usado só em teste/dev; a
+# produção é sempre Linux/RunCloud), a verificação do fd é pulada e o
+# caminho segue protegido apenas pela validação de pathname acima e pelo
+# lock compartilhado que o chamador deve segurar durante toda a leitura
+# (hub_item_acquire_lock_shared) — limitação residual documentada, não
+# fingida como resolvida.
 hub_staging_resolve() {
     local data_dir="$1" rel_path="$2" base target resolved_base resolved_target
-    STAGING_RESOLVED_PATH=""; STAGING_RESOLVED_TYPE=""
+    local fd_path
+    STAGING_RESOLVED_PATH=""; STAGING_RESOLVED_TYPE=""; STAGING_RESOLVED_FD=""
     base="${data_dir}"
     [[ -d "${base}" ]] || return 1
     resolved_base="$(cd "${base}" 2>/dev/null && pwd -P)" || return 1
@@ -1628,8 +1670,31 @@ hub_staging_resolve() {
     else
         return 2
     fi
+
+    # Abre o fd ANTES de qualquer nova checagem: um open() sobre um symlink
+    # (sem O_NOFOLLOW disponível em bash puro) segue o link, então a defesa
+    # real é comparar, DEPOIS de aberto, para onde o fd de fato aponta.
+    exec 11<"${resolved_target}" 2>/dev/null || return 1
+    if [[ -d "/proc/self/fd" ]]; then
+        fd_path="$(readlink -f "/proc/self/fd/11" 2>/dev/null)" || { exec 11<&-; return 1; }
+        if [[ "${fd_path}" != "${resolved_target}" ]]; then
+            exec 11<&-
+            return 1
+        fi
+    fi
+
     STAGING_RESOLVED_PATH="${resolved_target}"
+    STAGING_RESOLVED_FD=11
     return 0
+}
+
+# Fecha o fd aberto por hub_staging_resolve. Chamada obrigatória por todo
+# consumidor após terminar de ler (sucesso ou falha) — um fd 11 esquecido
+# aberto vazaria entre chamadas dentro do mesmo processo (list/stat/download
+# são processos de vida curta, mas o hábito evita reuso acidental do fd).
+hub_staging_close() {
+    exec 11<&- 2>/dev/null || true
+    STAGING_RESOLVED_FD=""
 }
 
 # Carrega apenas o necessário para operações read-only do HUB, sem mensagens
@@ -1864,9 +1929,21 @@ hub_staging_prepare_job() {
     return 0
 }
 
+# Caminho para ler o alvo já resolvido/aberto por hub_staging_resolve: usa
+# /proc/self/fd/<fd> quando disponível (Linux — sempre no servidor alvo),
+# senão cai para o pathname já validado (protegido pelo lock compartilhado
+# que o chamador está segurando durante toda a leitura).
+hub_staging_read_path() {
+    if [[ -n "${STAGING_RESOLVED_FD}" && -e "/proc/self/fd/${STAGING_RESOLVED_FD}" ]]; then
+        printf '/proc/self/fd/%s' "${STAGING_RESOLVED_FD}"
+    else
+        printf '%s' "${STAGING_RESOLVED_PATH}"
+    fi
+}
+
 run_hub_staging_list() {
     local job_id="$1" token="${2:-}" data_dir rel_path="/" i name kind entry_token
-    local items="" count=0 truncated=false entries_tmp
+    local items="" count=0 truncated=false entries_tmp read_path
 
     hub_staging_prepare_job "${job_id}" || return 1
     if [[ -n "${token}" ]]; then
@@ -1878,22 +1955,36 @@ run_hub_staging_list() {
     fi
 
     data_dir="$(hub_item_data_dir "${job_id}")"
+
+    # Lock COMPARTILHADO do início da validação até o fim da leitura: exclui
+    # um cleanup concorrente (lock exclusivo) removendo o staging embaixo
+    # desta listagem. Timeout curto e fail-closed — se não conseguir o lock,
+    # recusa em vez de ler sem proteção.
+    if ! hub_item_acquire_lock_shared 9 5; then
+        hub_json_error "staging_locked" "Staging temporariamente indisponível, tente novamente."
+        return 1
+    fi
+
     if ! hub_staging_resolve "${data_dir}" "${rel_path}"; then
+        exec 9<&-
         hub_json_error "item_not_found" "Item não encontrado no staging do job."
         return 1
     fi
-    [[ "${STAGING_RESOLVED_TYPE}" == "d" ]] || {
+    if [[ "${STAGING_RESOLVED_TYPE}" != "d" ]]; then
+        hub_staging_close; exec 9<&-
         hub_json_error "not_a_directory" "O item não é um diretório."
         return 1
-    }
+    fi
 
-    entries_tmp="$(mktemp)" || { hub_json_error "internal_error" "Falha ao preparar listagem."; return 1; }
+    entries_tmp="$(mktemp)" || { hub_staging_close; exec 9<&-; hub_json_error "internal_error" "Falha ao preparar listagem."; return 1; }
+    read_path="$(hub_staging_read_path)"
     # find -maxdepth 1: só filhos diretos. "-print0" (portátil — funciona em
     # GNU e BSD/macOS find; "-printf" é GNU-only) evita ambiguidade de nome
     # com espaço/newline antes da leitura em bash; o tipo (d/f/l/outro) é
     # decidido depois, por nó, com os testes -L/-d/-f do próprio bash.
-    if ! find "${STAGING_RESOLVED_PATH}" -mindepth 1 -maxdepth 1 -print0 > "${entries_tmp}" 2>/dev/null; then
+    if ! find "${read_path}" -mindepth 1 -maxdepth 1 -print0 > "${entries_tmp}" 2>/dev/null; then
         rm -f "${entries_tmp}"
+        hub_staging_close; exec 9<&-
         hub_json_error "staging_read_failed" "Falha ao ler o staging do job."
         return 1
     fi
@@ -1922,6 +2013,7 @@ run_hub_staging_list() {
         fi
         entry_token="$(hub_make_staging_token "${job_id}" "${child_rel}")" || {
             rm -f "${entries_tmp}"
+            hub_staging_close; exec 9<&-
             hub_json_error "token_generation_failed" "Falha ao proteger item do staging."
             return 1
         }
@@ -1930,6 +2022,7 @@ run_hub_staging_list() {
         ((count++))
     done < "${entries_tmp}"
     rm -f "${entries_tmp}"
+    hub_staging_close; exec 9<&-
 
     printf '{"version":%d,"ok":true,"action":"staging-list","job_id":"%s","limit":%d,"truncated":%s,"items":[%s]}\n' \
         "${HUB_API_VERSION}" "$(hub_json_escape "${job_id}")" "${HUB_NAV_LIMIT}" "${truncated}" "${items}"
@@ -1949,7 +2042,7 @@ hub_staging_local_size() {
 }
 
 run_hub_staging_stat() {
-    local job_id="$1" token="$2" data_dir rel_path size_bytes kind
+    local job_id="$1" token="$2" data_dir rel_path size_bytes kind read_path
 
     hub_staging_prepare_job "${job_id}" || return 1
     if ! hub_decode_staging_token "${job_id}" "${token}"; then
@@ -1957,15 +2050,24 @@ run_hub_staging_stat() {
         return 1
     fi
     rel_path="${G_SELECTED}"
-
     data_dir="$(hub_item_data_dir "${job_id}")"
+
+    # Mesmo lock compartilhado de run_hub_staging_list — ver comentário lá.
+    if ! hub_item_acquire_lock_shared 9 5; then
+        hub_json_error "staging_locked" "Staging temporariamente indisponível, tente novamente."
+        return 1
+    fi
+
     if ! hub_staging_resolve "${data_dir}" "${rel_path}"; then
+        exec 9<&-
         hub_json_error "item_not_found" "Item não encontrado no staging do job."
         return 1
     fi
 
     [[ "${STAGING_RESOLVED_TYPE}" == "d" ]] && kind="directory" || kind="file"
-    size_bytes="$(hub_staging_local_size "${STAGING_RESOLVED_PATH}")"
+    read_path="$(hub_staging_read_path)"
+    size_bytes="$(hub_staging_local_size "${read_path}")"
+    hub_staging_close; exec 9<&-
     [[ "${size_bytes}" =~ ^[0-9]+$ ]] || {
         hub_json_error "size_check_failed" "Não foi possível calcular o tamanho do item."
         return 1
@@ -1982,46 +2084,83 @@ run_hub_staging_stat() {
 # conteúdo, para o HUB poder gravar o stdout direto num arquivo sem risco de
 # misturar uma mensagem de erro no meio dos bytes binários.
 run_hub_staging_download() {
-    local job_id="$1" token="$2" data_dir rel_path
+    local job_id="$1" token="$2" data_dir rel_path rc
+
+    # A partir daqui, e até o fim desta função, stdout é reservado para
+    # bytes de conteúdo — o trap de EXIT/INT/TERM (topo do arquivo) checa
+    # esta flag antes de escrever qualquer texto em stdout, então um sinal
+    # recebido no meio do cat/tar não injeta aviso/erro no stream binário.
+    HUB_STDOUT_IS_BINARY=true
 
     # Validação própria, SEM hub_json_error: essa função escreve JSON no
     # stdout, o mesmo canal usado aqui para bytes binários — usá-la
     # contaminaria o stream de download com uma mensagem de erro. Qualquer
     # recusa neste comando vai só para stderr/log (via error()), nunca para
     # stdout, mesmo em caso de falha.
-    valid_job_id_selective "${job_id}" || { error "job_id inválido."; return 1; }
-    hub_token_key >/dev/null 2>>"${RESTORE_LOG_FILE}" || { error "Chave de tokens indisponível."; return 1; }
+    valid_job_id_selective "${job_id}" || { error "job_id inválido."; HUB_STDOUT_IS_BINARY=false; return 1; }
+    hub_token_key >/dev/null 2>>"${RESTORE_LOG_FILE}" || { error "Chave de tokens indisponível."; HUB_STDOUT_IS_BINARY=false; return 1; }
     if ! hub_staging_job_ready "${job_id}" 2>>"${RESTORE_LOG_FILE}"; then
         error "Job inexistente, ainda em execução, sem sucesso ou expirado."
+        HUB_STDOUT_IS_BINARY=false
         return 1
     fi
     if ! hub_decode_staging_token "${job_id}" "${token}" 2>>"${RESTORE_LOG_FILE}"; then
         error "Token de download inválido (job ${job_id})."
+        HUB_STDOUT_IS_BINARY=false
         return 1
     fi
     rel_path="${G_SELECTED}"
-
     data_dir="$(hub_item_data_dir "${job_id}")"
+
+    # Lock COMPARTILHADO do início da validação até o fim do cat/tar — ver
+    # hub_item_acquire_lock_shared. Fail-closed: sem o lock, recusa em vez de
+    # transmitir sem proteção contra um cleanup concorrente.
+    if ! hub_item_acquire_lock_shared 9 5 2>>"${RESTORE_LOG_FILE}"; then
+        error "Staging temporariamente indisponível (lock ocupado), tente novamente."
+        HUB_STDOUT_IS_BINARY=false
+        return 1
+    fi
+
     if ! hub_staging_resolve "${data_dir}" "${rel_path}" 2>>"${RESTORE_LOG_FILE}"; then
         error "Item não encontrado no staging do job ${job_id}."
+        exec 9<&-
+        HUB_STDOUT_IS_BINARY=false
         return 1
     fi
 
     if [[ "${STAGING_RESOLVED_TYPE}" == "f" ]]; then
-        # cat: sem transformação, sem carregar o arquivo inteiro em memória
-        # (kernel faz o streaming). Erros do próprio cat vão para stderr.
-        cat -- "${STAGING_RESOLVED_PATH}" 2>>"${RESTORE_LOG_FILE}"
-        return $?
+        # Lê DIRETO do fd já aberto e verificado por hub_staging_resolve
+        # (não reabre por nome — é exatamente essa reabertura que criaria a
+        # janela de TOCTOU). Sem transformação, sem carregar o arquivo
+        # inteiro em memória (kernel faz o streaming). Erros do próprio cat
+        # vão para stderr/log, nunca stdout.
+        cat <&11 2>>"${RESTORE_LOG_FILE}"
+        rc=$?
+        hub_staging_close; exec 9<&-
+        HUB_STDOUT_IS_BINARY=false
+        return "${rc}"
     fi
 
     # Diretório: empacota como tar direto no stdout. -C entra no PAI do alvo
     # e referencia só o nome final, então o tar contém um único diretório de
-    # topo com o nome do item (não o caminho absoluto do staging).
+    # topo com o nome do item (não o caminho absoluto do staging) — preserva
+    # esse nome porque bsdtar/GNU tar divergem na sintaxe de --transform/-s
+    # para renomear a partir de um -C baseado em /proc/self/fd, e introduzir
+    # esse ramo custaria mais risco do que resolve. A defesa contra reabrir
+    # um alvo trocado não é o fd aqui (tar precisa de um pathname), é o LOCK
+    # COMPARTILHADO seguro desde antes de hub_staging_resolve até aqui: um
+    # cleanup concorrente (lock exclusivo) não pode rodar `rm -rf`/recriar o
+    # job enquanto este lock estiver de pé, e nenhum outro comando allowlisted
+    # escreve em data/ de um job já concluído — só root, durante o próprio
+    # restore-item, antes do job existir para esta API.
     local parent_dir base_name
     parent_dir="$(dirname -- "${STAGING_RESOLVED_PATH}")"
     base_name="$(basename -- "${STAGING_RESOLVED_PATH}")"
     tar -C "${parent_dir}" -cf - -- "${base_name}" 2>>"${RESTORE_LOG_FILE}"
-    return $?
+    rc=$?
+    hub_staging_close; exec 9<&-
+    HUB_STDOUT_IS_BINARY=false
+    return "${rc}"
 }
 
 hub_job_log_file()    { echo "${HUB_JOB_LOG_DIR}/${1}.log"; }
@@ -2181,6 +2320,23 @@ hub_item_acquire_lock() {
     mkdir -p "$(dirname "${HUB_ITEM_LOCK_FILE}")" 2>/dev/null || true
     eval "exec ${fd}>\"\${HUB_ITEM_LOCK_FILE}\"" || return 1
     flock -n "${fd}"
+}
+
+# Variante COMPARTILHADA do mesmo lock global, usada pelos comandos de
+# leitura do staging (issue #10: staging-list/staging-stat/staging-download).
+# Múltiplos leitores podem segurar o lock ao mesmo tempo, mas nenhum deles
+# pode coexistir com o lock EXCLUSIVO que hub_item_remove_job adquire antes
+# do `rm -rf` — flock() do kernel garante essa exclusão mútua entre leitor(es)
+# e removedor, fechando a corrida em que um cleanup concorrente apagaria ou
+# truncaria o staging no meio de uma leitura/streaming. Bloqueante com
+# timeout curto (não indefinido): uma leitura não deve travar para sempre
+# esperando um cleanup que já terminou seu rm -rf rapidamente; se o timeout
+# estourar, quem chamou trata como falha (fail-closed, sem ler nada).
+hub_item_acquire_lock_shared() {
+    local fd="${1:-9}" timeout_s="${2:-5}"
+    mkdir -p "$(dirname "${HUB_ITEM_LOCK_FILE}")" 2>/dev/null || true
+    eval "exec ${fd}>\"\${HUB_ITEM_LOCK_FILE}\"" || return 1
+    flock -w "${timeout_s}" -s "${fd}"
 }
 
 # now_epoch/finalize_job_meta centralizam a transição final: toda saída do
